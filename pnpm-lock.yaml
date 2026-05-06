@@ -12,8 +12,8 @@ importers:
   .:
     dependencies:
       '@tummycrypt/scheduling-kit':
-        specifier: ^0.7.5
-        version: 0.7.5(@neondatabase/serverless@0.10.4)(@opentelemetry/api@1.9.1)(@tummycrypt/tinyland-auth@0.2.0(svelte@5.55.1(@typescript-eslint/types@8.58.0)))(@types/pg@8.11.6)(pg@8.20.0)(svelte@5.55.1(@typescript-eslint/types@8.58.0))
+        specifier: ^0.7.7
+        version: 0.7.7(@neondatabase/serverless@0.10.4)(@opentelemetry/api@1.9.1)(@tummycrypt/tinyland-auth@0.2.0(svelte@5.55.1(@typescript-eslint/types@8.58.0)))(@types/pg@8.11.6)(pg@8.20.0)(svelte@5.55.1(@typescript-eslint/types@8.58.0))
       effect:
         specifier: ^3.19.14
         version: 3.21.0
@@ -373,8 +373,8 @@ packages:
     peerDependencies:
       acorn: ^8.9.0
 
-  '@tummycrypt/scheduling-kit@0.7.5':
-    resolution: {integrity: sha512-8bS4PME3Z29tWYKqsyRHadJcGaY1hQHjTbeJvezL2VT7lWEaPQ0GbRuErGgnGFEE7Tdzo5OICuQHIubtNtr5LQ==}
+  '@tummycrypt/scheduling-kit@0.7.7':
+    resolution: {integrity: sha512-ChnfRWS7Pb84iyCkDYY3PmD4xKTOKCp/yxjYY2rBJLNDn2+ZVwLDlt10QTaigHAH9YpoVL4BVTcPizqQeRIfQQ==}
     engines: {node: '>=20 <25'}
     peerDependencies:
       '@skeletonlabs/skeleton': ^4.0.0
@@ -1418,7 +1418,7 @@ snapshots:
     dependencies:
       acorn: 8.16.0
 
-  '@tummycrypt/scheduling-kit@0.7.5(@neondatabase/serverless@0.10.4)(@opentelemetry/api@1.9.1)(@tummycrypt/tinyland-auth@0.2.0(svelte@5.55.1(@typescript-eslint/types@8.58.0)))(@types/pg@8.11.6)(pg@8.20.0)(svelte@5.55.1(@typescript-eslint/types@8.58.0))':
+  '@tummycrypt/scheduling-kit@0.7.7(@neondatabase/serverless@0.10.4)(@opentelemetry/api@1.9.1)(@tummycrypt/tinyland-auth@0.2.0(svelte@5.55.1(@typescript-eslint/types@8.58.0)))(@types/pg@8.11.6)(pg@8.20.0)(svelte@5.55.1(@typescript-eslint/types@8.58.0))':
     dependencies:
       '@tummycrypt/tinyland-auth-pg': 0.2.4(@opentelemetry/api@1.9.1)(@tummycrypt/tinyland-auth@0.2.0(svelte@5.55.1(@typescript-eslint/types@8.58.0)))(@types/pg@8.11.6)
       drizzle-orm: 0.39.3(@neondatabase/serverless@0.10.4)(@opentelemetry/api@1.9.1)(@types/pg@8.11.6)(pg@8.20.0)

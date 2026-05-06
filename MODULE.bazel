@@ -20,7 +20,7 @@ Adapter targets:
 
 module(
     name = "tummycrypt_scheduling_bridge",
-    version = "0.4.9",
+    version = "0.4.10",
     compatibility_level = 1,
 )
 
@@ -46,7 +46,7 @@ bazel_dep(name = "aspect_rules_swc", version = "2.6.1")
 # =============================================================================
 
 # Primary dependency: scheduling-kit (peer; bridge orchestrates over kit's adapters).
-bazel_dep(name = "tummycrypt_scheduling_kit", version = "0.7.5")
+bazel_dep(name = "tummycrypt_scheduling_kit", version = "0.7.7")
 
 # Auth surface (payment capability types come through tinyland-auth).
 bazel_dep(name = "tummycrypt_tinyland_auth", version = "0.3.0")

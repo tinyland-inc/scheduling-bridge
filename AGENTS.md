@@ -39,7 +39,7 @@ That makes this repo central to the migration paper and to the operational beta-
 
 ## Current Tracking
 
-As of `2026-04-25`, the active structural work here is:
+As of `2026-05-08`, the active structural work here is:
 
 - `TIN-89` package, Bazel, CI, publish, and dependency truth across shared
   scheduling packages
@@ -52,11 +52,11 @@ As of `2026-04-25`, the active structural work here is:
 
 Operationally relevant truth:
 
-- current package metadata is `@tummycrypt/scheduling-bridge` `0.4.10`
-- `0.4.10` depends on `@tummycrypt/scheduling-kit ^0.7.7`
-- as of `2026-05-06`, the package metadata is ahead of the last published
-  release so scheduling-kit dependency freshness can be validated before the
-  next tag/publish edge
+- current package metadata is `@tummycrypt/scheduling-bridge` `0.5.2`
+- `0.5.2` depends on `@tummycrypt/scheduling-kit ^0.8.0`
+- the `0.5.x` line is the async bridge redesign lane: async booking jobs,
+  availability snapshots, Redis/Postgres async stores, and request-path
+  availability prewarm enqueueing
 - package metadata, git tags, npm dist-tags, GitHub releases, and deployed
   bridge runtime tuples remain separate authority surfaces and should be
   verified explicitly
@@ -73,8 +73,9 @@ Current provider truth:
 
 - K8s/container execution is the accepted next-production bridge route and is
   the current K8s shadow runtime for MassageIthaca scheduling-bridge traffic.
-- Modal remains legacy proofing/fallback context, and may still serve stable
-  live consumer traffic until that traffic is deliberately moved to K8s.
+- Modal remains legacy proofing context only. The forward production path is
+  K8s-native bridge execution; do not re-enable automatic Modal deploys without
+  reopening the provider-spend/runtime decision.
 - Cluster state, tailnet exposure, and public-edge routing are infrastructure
   concerns outside this repo.
 - Docker/container execution must mirror the same built Node entrypoint so K8s
@@ -102,6 +103,18 @@ entrypoint and runtime assumptions as every other provider.
 
 If Modal, Docker, and K8s drift from the actual Node entrypoint, that is an
 operational bug.
+
+K8s async runtime truth:
+
+- `BRIDGE_DATABASE_URL` is the strict durable async queue/snapshot store when
+  Postgres is configured.
+- `REDIS_URL` is also a valid K8s async store when Postgres is absent; it backs
+  both the read cache and the Redis job/snapshot store.
+- `BRIDGE_INLINE_WORKER_ENABLED` defaults on when Postgres or Redis is
+  configured, so a single HTTP deployment can drain queued jobs until a
+  separate worker deployment exists.
+- request-path date/slot prewarm must enqueue async refresh jobs; browser
+  scraping for prewarm is worker-owned, not request-owned.
 
 ### Release Coordination
 

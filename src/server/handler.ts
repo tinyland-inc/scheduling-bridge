@@ -92,6 +92,7 @@ import {
 	type BridgeAsyncStore,
 } from '../async/store.js';
 import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
+import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
 import type {
 	AvailabilitySnapshotKind,
 	BridgeAdapterProfile,
@@ -99,6 +100,10 @@ import type {
 	BridgeJobRecord,
 	EnqueueBridgeJobResponse,
 } from '../async/types.js';
+import {
+	createAcuityBridgeJobExecutor,
+	runBridgeWorkerLoop,
+} from './worker.js';
 import type {
 	Booking,
 	BookingRequest,
@@ -381,6 +386,12 @@ export const __setEffectRunnerForTest = (runner: RunEffect | null) => {
 const BRIDGE_DATABASE_URL = process.env.BRIDGE_DATABASE_URL;
 const REDIS_URL = process.env.REDIS_URL;
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+const BRIDGE_INLINE_WORKER_ENABLED = (() => {
+	const raw = process.env.BRIDGE_INLINE_WORKER_ENABLED;
+	if (raw === 'true') return true;
+	if (raw === 'false') return false;
+	return Boolean(BRIDGE_DATABASE_URL || REDIS_URL);
+})();
 
 const redisClient: IORedis | null = REDIS_URL
 	? new IORedisImpl(REDIS_URL, {
@@ -461,6 +472,23 @@ const createBridgeAsyncStore = (): BridgeAsyncStore => {
 		});
 		return store;
 	}
+	if (redisClient) {
+		const store = createRedisBridgeAsyncStore({
+			client: redisClient,
+			keyPrefix: process.env.BRIDGE_REDIS_ASYNC_PREFIX,
+		});
+		void store.ready().catch((error) => {
+			logEvent('ERROR', 'Bridge async Redis store readiness failed', {
+				event: 'bridge_async_store_ready_failed',
+				error: describeLogValue(error),
+			});
+		});
+		logEvent('INFO', 'Bridge async store selected', {
+			event: 'bridge_async_store_selected',
+			mode: 'redis',
+		});
+		return store;
+	}
 	logEvent('INFO', 'Bridge async store selected', {
 		event: 'bridge_async_store_selected',
 		mode: 'memory',
@@ -469,8 +497,42 @@ const createBridgeAsyncStore = (): BridgeAsyncStore => {
 };
 
 let bridgeAsyncStore: BridgeAsyncStore = createBridgeAsyncStore();
+let inlineWorkerAbortController: AbortController | null = null;
+
+const startInlineWorker = () => {
+	if (!BRIDGE_INLINE_WORKER_ENABLED || inlineWorkerAbortController) return;
+	inlineWorkerAbortController = new AbortController();
+	const workerId = `${process.env.HOSTNAME ?? `pid-${process.pid}`}:inline`;
+	void runBridgeWorkerLoop(
+		bridgeAsyncStore,
+		createAcuityBridgeJobExecutor({ redisClient }),
+		{
+			workerId,
+			signal: inlineWorkerAbortController.signal,
+		},
+	).catch((error) => {
+		if (inlineWorkerAbortController?.signal.aborted) return;
+		logEvent('ERROR', 'Inline bridge worker failed', {
+			event: 'bridge_inline_worker_failed',
+			workerId,
+			error: describeLogValue(error),
+		});
+	});
+	logEvent('INFO', 'Inline bridge worker started', {
+		event: 'bridge_inline_worker_started',
+		workerId,
+		store: BRIDGE_DATABASE_URL ? 'postgres' : redisClient ? 'redis' : 'memory',
+	});
+};
+
+const stopInlineWorker = () => {
+	if (!inlineWorkerAbortController) return;
+	inlineWorkerAbortController.abort();
+	inlineWorkerAbortController = null;
+};
 
 export const __setBridgeAsyncStoreForTest = (store: BridgeAsyncStore | null) => {
+	stopInlineWorker();
 	if (closeBridgeAsyncStore) {
 		void closeBridgeAsyncStore().catch(() => undefined);
 		closeBridgeAsyncStore = null;
@@ -602,9 +664,67 @@ const recordAvailabilitySnapshot = async (
 	}
 };
 
+const enqueueAvailabilityPrewarmJob = (
+	context: RequestContext,
+	options: {
+		readonly kind: AvailabilitySnapshotKind;
+		readonly serviceId: string;
+		readonly serviceName?: string;
+		readonly scope: string;
+	},
+) => {
+	const idempotencyKey = [
+		'availability-prewarm',
+		ACUITY_BASE_URL,
+		options.kind,
+		options.serviceId,
+		options.scope,
+	].join(':');
+
+	const job: BridgeJobCommand = options.kind === 'dates'
+		? {
+				kind: 'availability_dates_refresh',
+				command: {
+					serviceId: options.serviceId,
+					serviceName: options.serviceName,
+					month: options.scope,
+					adapterProfile: adapterProfile(),
+				},
+			}
+		: {
+				kind: 'availability_slots_refresh',
+				command: {
+					serviceId: options.serviceId,
+					serviceName: options.serviceName,
+					date: options.scope,
+					adapterProfile: adapterProfile(),
+				},
+			};
+
+	void bridgeAsyncStore.enqueueJob(job, { idempotencyKey }).then((record) => {
+		logRequestEvent('INFO', 'Availability prewarm job enqueued', context, {
+			event: 'availability_prewarm_job_enqueued',
+			operationId: record.operationId,
+			status: record.status,
+			kind: options.kind,
+			serviceId: options.serviceId,
+			scope: options.scope,
+		});
+	}).catch((error) => {
+		logRequestEvent('WARN', 'Availability prewarm enqueue failed', context, {
+			event: 'availability_prewarm_enqueue_failed',
+			kind: options.kind,
+			serviceId: options.serviceId,
+			scope: options.scope,
+			error: describeLogValue(error),
+		});
+	});
+};
+
 const scheduleDatePrewarm = (
 	context: RequestContext,
 	serviceId: string,
+	serviceName: string | undefined,
 	currentMonth: string | undefined,
 ): void => {
 	if (!redisClient || DATE_PREWARM_MONTHS <= 0 || !isAcuityAppointmentTypeId(serviceId)) {
@@ -612,28 +732,11 @@ const scheduleDatePrewarm = (
 	}
 
 	for (const month of selectDatePrewarmMonths(currentMonth, DATE_PREWARM_MONTHS)) {
-		const cacheKey = buildAvailabilityDatesCacheKey(ACUITY_BASE_URL, serviceId, month);
-		void runCachedBridgeRead(context, 'availability_dates', cacheKey, () =>
-			runEffect(acuitySteps.readDatesViaUrl(serviceId, month)),
-		).then((result) => {
-			if (!result.ok) {
-				logRequestEvent('WARN', 'Availability dates prewarm failed', context, {
-					event: 'availability_dates_prewarm_failed',
-					serviceId,
-					targetMonth: month,
-					errorTag: result.error._tag,
-					errorCode: 'code' in result.error ? result.error.code : 'UNKNOWN',
-					errorMessage: 'message' in result.error ? result.error.message : 'Date prewarm failed',
-				});
-				return;
-			}
-
-			logRequestEvent('INFO', 'Availability dates prewarm completed', context, {
-				event: 'availability_dates_prewarm_completed',
-				serviceId,
-				targetMonth: month,
-				dateCount: Array.isArray(result.value) ? result.value.length : undefined,
-			});
+		enqueueAvailabilityPrewarmJob(context, {
+			kind: 'dates',
+			serviceId,
+			serviceName,
+			scope: month,
 		});
 	}
 };
@@ -641,6 +744,7 @@ const scheduleDatePrewarm = (
 const scheduleSlotPrewarm = (
 	context: RequestContext,
 	serviceId: string,
+	serviceName: string | undefined,
 	dates: readonly { date?: unknown }[],
 ): void => {
 	if (!redisClient || SLOT_PREWARM_LIMIT <= 0 || !isAcuityAppointmentTypeId(serviceId)) {
@@ -657,39 +761,14 @@ const scheduleSlotPrewarm = (
 		limit: SLOT_PREWARM_LIMIT,
 	});
 
-	void (async () => {
-		for (const date of prewarmDates) {
-			const startedAt = Date.now();
-			const cacheKey = buildAvailabilitySlotsCacheKey(ACUITY_BASE_URL, serviceId, date);
-			const result = await runCachedBridgeRead(context, 'availability_slots', cacheKey, () =>
-				runEffect(
-					acuitySteps.readSlotsViaUrl(
-						serviceId,
-						date,
-						createSlotReadTelemetryContext(context, 'availability_slots_prewarm'),
-					),
-				),
-			);
-
-			logRequestEvent(result.ok ? 'INFO' : 'WARN', 'Availability slot prewarm completed', context, {
-				event: 'availability_slot_prewarm_completed',
-				serviceId,
-				date,
-				durationMs: Date.now() - startedAt,
-				ok: result.ok,
-				...(result.ok
-					? { slots: Array.isArray(result.value) ? result.value.length : undefined }
-					: { error: describeLogValue(result.error) }),
-			});
-		}
-	})().catch((error) => {
-		logRequestEvent('ERROR', 'Availability slot prewarm failed', context, {
-			event: 'availability_slot_prewarm_failed',
+	for (const date of prewarmDates) {
+		enqueueAvailabilityPrewarmJob(context, {
+			kind: 'slots',
 			serviceId,
-			dates: prewarmDates,
-			error: describeLogValue(error),
+			serviceName,
+			scope: date,
 		});
-	});
+	}
 };
 
 // =============================================================================
@@ -856,8 +935,8 @@ const handleAvailableDates = async (req: IncomingMessage, res: ServerResponse, c
 		Array.isArray(result.value) ? result.value : [],
 		context,
 	);
-	scheduleDatePrewarm(context, body.serviceId, targetMonth);
-	scheduleSlotPrewarm(context, body.serviceId, result.value);
+	scheduleDatePrewarm(context, body.serviceId, body.serviceName, targetMonth);
+	scheduleSlotPrewarm(context, body.serviceId, body.serviceName, result.value);
 	sendSuccess(res, result.value);
 };
 
@@ -1361,13 +1440,15 @@ const disposeBridgeAsyncStore = () => {
 	closeBridgeAsyncStore = null;
 };
 
+server.on('close', stopInlineWorker);
 server.on('close', disposeBrowserRuntime);
-server.on('close', disposeRedisClient);
 server.on('close', disposeBridgeAsyncStore);
+server.on('close', disposeRedisClient);
 
 // Only start listening when this file is executed directly (not imported)
 if (process.argv[1]?.match(/handler\.(ts|js|mjs)$/)) {
 	server.listen(PORT, '0.0.0.0', () => {
+		startInlineWorker();
 		logEvent('INFO', 'Middleware server listening', {
 			event: 'runtime_started',
 			port: PORT,

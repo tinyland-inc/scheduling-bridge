@@ -20,7 +20,7 @@ Adapter targets:
 
 module(
     name = "tummycrypt_scheduling_bridge",
-    version = "0.5.1",
+    version = "0.5.2",
     compatibility_level = 1,
 )
 

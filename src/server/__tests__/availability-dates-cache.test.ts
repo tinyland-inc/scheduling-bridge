@@ -2,6 +2,7 @@ import { type AddressInfo } from 'node:net';
 import { Effect } from 'effect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BrowserError } from '../../adapters/acuity/errors.js';
+import { createInMemoryBridgeAsyncStore } from '../../async/store.js';
 
 const readViaUrlMocks = vi.hoisted(() => ({
 	readDatesViaUrl: vi.fn(),
@@ -97,8 +98,11 @@ const listen = async () => {
 		__runEffectWithoutBrowserForTest,
 		__setEffectRunnerForTest,
 		__setAcuityStepOverridesForTest,
+		__setBridgeAsyncStoreForTest,
 	} = await import('../handler.js');
+	const store = createInMemoryBridgeAsyncStore();
 	__setEffectRunnerForTest(__runEffectWithoutBrowserForTest);
+	__setBridgeAsyncStoreForTest(store);
 	__setAcuityStepOverridesForTest({
 		readDatesViaUrl: readViaUrlMocks.readDatesViaUrl,
 		readSlotsViaUrl: readViaUrlMocks.readSlotsViaUrl,
@@ -111,6 +115,7 @@ const listen = async () => {
 	const address = server.address() as AddressInfo;
 	return {
 		server,
+		store,
 		baseUrl: `http://127.0.0.1:${address.port}`,
 	};
 };
@@ -164,7 +169,7 @@ describe('POST /availability/dates cache prewarm', () => {
 		delete process.env.AUTH_TOKEN;
 	});
 
-	it('warms the next month after a successful date request', async () => {
+	it('queues the next month after a successful date request', async () => {
 		const running = await listen();
 		activeServer = running.server;
 
@@ -176,39 +181,40 @@ describe('POST /availability/dates cache prewarm', () => {
 			data: [{ date: '2026-07-15' }],
 		});
 
-		await vi.waitFor(
-			() => {
-				expect(readViaUrlMocks.readDatesViaUrl).toHaveBeenCalledWith(
-					serviceId,
-					'2026-08',
-				);
-				expect(
-					redisState.values.get(
-						`bridge-read:v2:dates:${baseUrl}:${serviceId}:2026-08`,
-					),
-				).toBe(JSON.stringify([{ date: '2026-08-15' }]));
-			},
-			{ timeout: 5_000 },
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(readViaUrlMocks.readDatesViaUrl).toHaveBeenCalledWith(
+			serviceId,
+			'2026-07',
 		);
+		expect(readViaUrlMocks.readDatesViaUrl).not.toHaveBeenCalledWith(
+			serviceId,
+			'2026-08',
+		);
+		await expect(running.store.listReadyJobs(10)).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: 'availability_dates_refresh',
+					command: expect.objectContaining({
+						serviceId,
+						month: '2026-08',
+					}),
+				}),
+			]),
+		);
+		expect(
+			redisState.values.get(
+				`bridge-read:v2:dates:${baseUrl}:${serviceId}:2026-08`,
+			),
+		).toBeUndefined();
 	});
 
-	it('serves a prewarmed month from Redis without rereading Acuity for that month', async () => {
+	it('serves a cached month from Redis and queues the following month', async () => {
+		redisState.values.set(
+			`bridge-read:v2:dates:${baseUrl}:${serviceId}:2026-08`,
+			JSON.stringify([{ date: '2026-08-15' }]),
+		);
 		const running = await listen();
 		activeServer = running.server;
-
-		await postAvailabilityDates(running.baseUrl, '2026-07-01');
-		await vi.waitFor(
-			() => {
-				expect(
-					redisState.values.get(
-						`bridge-read:v2:dates:${baseUrl}:${serviceId}:2026-08`,
-					),
-				).toBe(JSON.stringify([{ date: '2026-08-15' }]));
-			},
-			{ timeout: 5_000 },
-		);
-
-		readViaUrlMocks.readDatesViaUrl.mockClear();
 
 		const response = await postAvailabilityDates(running.baseUrl, '2026-08-01');
 
@@ -221,15 +227,17 @@ describe('POST /availability/dates cache prewarm', () => {
 			serviceId,
 			'2026-08',
 		);
-		await vi.waitFor(
-			() => {
-				expect(
-					redisState.values.get(
-						`bridge-read:v2:dates:${baseUrl}:${serviceId}:2026-09`,
-					),
-				).toBe(JSON.stringify([{ date: '2026-09-15' }]));
-			},
-			{ timeout: 5_000 },
+		await new Promise((resolve) => setImmediate(resolve));
+		await expect(running.store.listReadyJobs(10)).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: 'availability_dates_refresh',
+					command: expect.objectContaining({
+						serviceId,
+						month: '2026-09',
+					}),
+				}),
+			]),
 		);
 	});
 

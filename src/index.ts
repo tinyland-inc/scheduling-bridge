@@ -50,6 +50,10 @@ export {
 	type PostgresBridgeAsyncStoreOptions,
 } from './async/postgres-store.js';
 export {
+	createRedisBridgeAsyncStore,
+	type RedisBridgeAsyncStoreOptions,
+} from './async/redis-store.js';
+export {
 	BridgeJobExecutionError,
 	drainReadyBridgeJobs,
 	executeBridgeJob,

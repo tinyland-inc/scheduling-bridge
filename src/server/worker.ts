@@ -1,5 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { Effect, Exit, Cause, ManagedRuntime, Scope } from 'effect';
+import { Redis as IORedisImpl } from 'ioredis';
+import type { Redis as IORedis } from 'ioredis';
 import {
 	BrowserProcessLive,
 	BrowserService,
@@ -22,6 +24,8 @@ import {
 	readDatesViaUrl,
 	readSlotsViaUrl,
 } from '../adapters/acuity/steps/read-via-url.js';
+import { buildAvailabilityDatesCacheKey } from './date-prewarm.js';
+import { buildAvailabilitySlotsCacheKey } from './slot-prewarm.js';
 import type {
 	AppointmentCommand,
 	AvailabilityDatesRefreshCommand,
@@ -30,6 +34,7 @@ import type {
 import type { BridgeAsyncStore } from '../async/store.js';
 import { createInMemoryBridgeAsyncStore } from '../async/store.js';
 import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
+import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
 import {
 	BridgeJobExecutionError,
 	drainReadyBridgeJobs,
@@ -40,6 +45,16 @@ import { ndjsonLog } from '../shared/logger.js';
 
 const ACUITY_BASE_URL = process.env.ACUITY_BASE_URL ?? 'https://example.as.me';
 const BRIDGE_DATABASE_URL = process.env.BRIDGE_DATABASE_URL;
+const REDIS_URL = process.env.REDIS_URL;
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+const READ_CACHE_TTL_SECONDS = (() => {
+	const parsed = Number(process.env.ACUITY_READ_CACHE_TTL_SECONDS ?? 20 * 60);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 20 * 60;
+})();
+const EMPTY_READ_CACHE_TTL_SECONDS = (() => {
+	const parsed = Number(process.env.ACUITY_EMPTY_READ_CACHE_TTL_SECONDS ?? 2 * 60);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 2 * 60;
+})();
 
 const browserConfig: BrowserConfig = {
 	...defaultBrowserConfig,
@@ -51,6 +66,23 @@ const browserConfig: BrowserConfig = {
 };
 
 const browserRuntime = ManagedRuntime.make(BrowserProcessLive(browserConfig));
+
+const createRedisClient = (): IORedis | null =>
+	REDIS_URL
+		? new IORedisImpl(REDIS_URL, {
+				password: REDIS_PASSWORD,
+				maxRetriesPerRequest: 3,
+			})
+		: null;
+
+let defaultExecutorRedisClient: IORedis | null | undefined;
+
+const getDefaultExecutorRedisClient = (): IORedis | null => {
+	if (defaultExecutorRedisClient === undefined) {
+		defaultExecutorRedisClient = createRedisClient();
+	}
+	return defaultExecutorRedisClient;
+};
 
 const logEvent = (
 	level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR',
@@ -133,115 +165,191 @@ const assertPaymentBypassProven = (result: {
 	}
 };
 
-export const createAcuityBridgeJobExecutor = (): BridgeJobExecutor => ({
-	refreshAvailabilityDates: async (command: AvailabilityDatesRefreshCommand) => {
-		if (isAcuityAppointmentTypeId(command.serviceId)) {
-			return runWizardStep(
-				readDatesViaUrl(command.serviceId, command.month),
-				'refresh-availability-dates',
-			);
-		}
-		return runWizardStep(
-			readAvailableDates({
-				serviceName: command.serviceName ?? command.serviceId,
-				targetMonth: command.month,
-				monthsToScan: 2,
-			}),
-			'refresh-availability-dates',
-		);
-	},
+const valueTtlSeconds = (value: readonly unknown[]): number =>
+	value.length === 0 ? EMPTY_READ_CACHE_TTL_SECONDS : READ_CACHE_TTL_SECONDS;
 
-	refreshAvailabilitySlots: async (command: AvailabilitySlotsRefreshCommand) => {
-		if (isAcuityAppointmentTypeId(command.serviceId)) {
-			return runWizardStep(
-				readSlotsViaUrl(command.serviceId, command.date),
-				'refresh-availability-slots',
-			);
-		}
-		return runWizardStep(
-			readTimeSlots({
-				serviceName: command.serviceName ?? command.serviceId,
-				date: command.date,
-			}),
-			'refresh-availability-slots',
+const writeReadCache = async (
+	redisClient: IORedis | null,
+	cacheKind: 'availability_dates' | 'availability_slots',
+	cacheKey: string,
+	value: readonly unknown[],
+) => {
+	if (!redisClient) return;
+	try {
+		await redisClient.set(
+			cacheKey,
+			JSON.stringify(value),
+			'EX',
+			valueTtlSeconds(value),
 		);
-	},
+		logEvent('INFO', 'Bridge worker wrote read cache', {
+			event: 'bridge_worker_read_cache_written',
+			cacheKind,
+			cacheKey,
+			valueCount: value.length,
+		});
+	} catch (error) {
+		logEvent('WARN', 'Bridge worker read cache write failed', {
+			event: 'bridge_worker_read_cache_write_failed',
+			cacheKind,
+			cacheKey,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+};
 
-	createBookingWithPayment: async (command: AppointmentCommand, context) => {
-		if (context.executionPath === 'rest') {
-			throw new BridgeJobExecutionError({
-				status: 'failed_pre_submit',
-				code: 'REST_BOOKING_NOT_WIRED',
-				message: 'Acuity REST booking execution is selected but not wired in this worker',
-				step: 'execution-path',
-				retryable: false,
-			});
-		}
-		const serviceName = command.serviceName ?? command.request.serviceId;
-		await runWizardStep(
-			navigateToBooking({
-				serviceName,
-				datetime: command.request.datetime,
-				client: command.request.client,
-				appointmentTypeId: command.request.serviceId,
-			}),
-			'navigate',
-		);
-		await runWizardStep(
-			fillFormFields({
-				client: command.request.client,
-				customFields: command.request.client.customFields,
-			}),
-			'fill-form',
-		);
-		if (!command.couponCode) {
-			throw new BridgeJobExecutionError({
-				status: 'failed_pre_submit',
-				code: 'COUPON_REQUIRED',
-				message: 'Browser booking execution requires a coupon bypass code',
-				step: 'bypass-payment',
-				retryable: false,
-			});
-		}
-		const bypass = await runWizardStep(
-			bypassPayment(command.couponCode),
-			'bypass-payment',
-		);
-		assertPaymentBypassProven(bypass);
-		await runWizardStep(
-			submitBooking(),
-			'submit',
-			'reconcile_required',
-		);
-		const confirmation = await runWizardStep(
-			extractConfirmation(),
-			'extract-confirmation',
-			'reconcile_required',
-		);
-		return toBooking(
-			confirmation,
-			command.request,
-			command.paymentRef,
-			command.paymentProcessor,
-		);
-	},
-});
+export interface AcuityBridgeJobExecutorOptions {
+	readonly redisClient?: IORedis | null;
+}
+
+export const createAcuityBridgeJobExecutor = (
+	options: AcuityBridgeJobExecutorOptions = {},
+): BridgeJobExecutor => {
+	const readCacheRedisClient =
+		options.redisClient === undefined
+			? getDefaultExecutorRedisClient()
+			: options.redisClient;
+
+	return {
+		refreshAvailabilityDates: async (command: AvailabilityDatesRefreshCommand) => {
+			const dates = isAcuityAppointmentTypeId(command.serviceId)
+				? await runWizardStep(
+						readDatesViaUrl(command.serviceId, command.month),
+						'refresh-availability-dates',
+					)
+				: await runWizardStep(
+					readAvailableDates({
+						serviceName: command.serviceName ?? command.serviceId,
+						targetMonth: command.month,
+						monthsToScan: 2,
+					}),
+					'refresh-availability-dates',
+				);
+			await writeReadCache(
+				readCacheRedisClient,
+				'availability_dates',
+				buildAvailabilityDatesCacheKey(
+					command.adapterProfile.baseUrl,
+					command.serviceId,
+					command.month,
+				),
+				dates,
+			);
+			return dates;
+		},
+
+		refreshAvailabilitySlots: async (command: AvailabilitySlotsRefreshCommand) => {
+			const slots = isAcuityAppointmentTypeId(command.serviceId)
+				? await runWizardStep(
+						readSlotsViaUrl(command.serviceId, command.date),
+						'refresh-availability-slots',
+					)
+				: await runWizardStep(
+					readTimeSlots({
+						serviceName: command.serviceName ?? command.serviceId,
+						date: command.date,
+					}),
+					'refresh-availability-slots',
+				);
+			await writeReadCache(
+				readCacheRedisClient,
+				'availability_slots',
+				buildAvailabilitySlotsCacheKey(
+					command.adapterProfile.baseUrl,
+					command.serviceId,
+					command.date,
+				),
+				slots,
+			);
+			return slots;
+		},
+
+		createBookingWithPayment: async (command: AppointmentCommand, context) => {
+			if (context.executionPath === 'rest') {
+				throw new BridgeJobExecutionError({
+					status: 'failed_pre_submit',
+					code: 'REST_BOOKING_NOT_WIRED',
+					message: 'Acuity REST booking execution is selected but not wired in this worker',
+					step: 'execution-path',
+					retryable: false,
+				});
+			}
+			const serviceName = command.serviceName ?? command.request.serviceId;
+			await runWizardStep(
+				navigateToBooking({
+					serviceName,
+					datetime: command.request.datetime,
+					client: command.request.client,
+					appointmentTypeId: command.request.serviceId,
+				}),
+				'navigate',
+			);
+			await runWizardStep(
+				fillFormFields({
+					client: command.request.client,
+					customFields: command.request.client.customFields,
+				}),
+				'fill-form',
+			);
+			if (!command.couponCode) {
+				throw new BridgeJobExecutionError({
+					status: 'failed_pre_submit',
+					code: 'COUPON_REQUIRED',
+					message: 'Browser booking execution requires a coupon bypass code',
+					step: 'bypass-payment',
+					retryable: false,
+				});
+			}
+			const bypass = await runWizardStep(
+				bypassPayment(command.couponCode),
+				'bypass-payment',
+			);
+			assertPaymentBypassProven(bypass);
+			await runWizardStep(
+				submitBooking(),
+				'submit',
+				'reconcile_required',
+			);
+			const confirmation = await runWizardStep(
+				extractConfirmation(),
+				'extract-confirmation',
+				'reconcile_required',
+			);
+			return toBooking(
+				confirmation,
+				command.request,
+				command.paymentRef,
+				command.paymentProcessor,
+			);
+		},
+	};
+};
 
 export const createWorkerStore = (): BridgeAsyncStore & {
 	readonly close?: () => Promise<void>;
 } => {
-	if (!BRIDGE_DATABASE_URL) {
-		logEvent('WARN', 'Bridge worker using in-memory store', {
-			event: 'bridge_worker_memory_store',
+	if (BRIDGE_DATABASE_URL) {
+		const store = createPostgresBridgeAsyncStore({
+			connectionString: BRIDGE_DATABASE_URL,
+			ssl: process.env.BRIDGE_DATABASE_SSL === 'true',
+			migrate: process.env.BRIDGE_DATABASE_MIGRATE !== 'false',
 		});
-		return createInMemoryBridgeAsyncStore();
+		return store;
 	}
-	const store = createPostgresBridgeAsyncStore({
-		connectionString: BRIDGE_DATABASE_URL,
-		ssl: process.env.BRIDGE_DATABASE_SSL === 'true',
-		migrate: process.env.BRIDGE_DATABASE_MIGRATE !== 'false',
+	if (REDIS_URL) {
+		return createRedisBridgeAsyncStore({
+			url: REDIS_URL,
+			redisOptions: {
+				password: REDIS_PASSWORD,
+				maxRetriesPerRequest: 3,
+			},
+			keyPrefix: process.env.BRIDGE_REDIS_ASYNC_PREFIX,
+		});
+	}
+	logEvent('WARN', 'Bridge worker using in-memory store', {
+		event: 'bridge_worker_memory_store',
 	});
-	return store;
+	return createInMemoryBridgeAsyncStore();
 };
 
 export const runBridgeWorkerLoop = async (

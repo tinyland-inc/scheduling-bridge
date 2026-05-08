@@ -1,4 +1,5 @@
 import { type AddressInfo } from 'node:net';
+import IORedisMock from 'ioredis-mock';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInMemoryBridgeAsyncStore } from '../../async/store.js';
 
@@ -27,6 +28,7 @@ const listen = async (store = createInMemoryBridgeAsyncStore()) => {
 	const {
 		server,
 		__setBridgeAsyncStoreForTest,
+		__setEffectRunnerForTest,
 	} = await import('../handler.js');
 	__setBridgeAsyncStoreForTest(store);
 	await new Promise<void>((resolve) => {
@@ -37,6 +39,7 @@ const listen = async (store = createInMemoryBridgeAsyncStore()) => {
 		server,
 		store,
 		baseUrl: `http://127.0.0.1:${address.port}`,
+		setEffectRunnerForTest: __setEffectRunnerForTest,
 	};
 };
 
@@ -62,6 +65,9 @@ describe('bridge async protocol endpoints', () => {
 		delete process.env.ACUITY_BASE_URL;
 		delete process.env.SERVICES_JSON;
 		delete process.env.ACUITY_BYPASS_COUPON;
+		delete process.env.ACUITY_DATE_PREWARM_MONTHS;
+		delete process.env.ACUITY_SLOT_PREWARM_LIMIT;
+		vi.doUnmock('ioredis');
 	});
 
 	it('enqueues paid booking commands without running browser automation in the request', async () => {
@@ -173,5 +179,61 @@ describe('bridge async protocol endpoints', () => {
 				value: [{ date: '2026-06-15' }],
 			},
 		});
+	});
+
+	it('queues availability prewarm jobs instead of running prewarm browser work on the request path', async () => {
+		vi.doMock('ioredis', () => ({
+			Redis: IORedisMock,
+			default: IORedisMock,
+		}));
+		process.env.REDIS_URL = 'redis://localhost:6379/0';
+		process.env.ACUITY_DATE_PREWARM_MONTHS = '1';
+		process.env.ACUITY_SLOT_PREWARM_LIMIT = '1';
+		const store = createInMemoryBridgeAsyncStore();
+		const running = await listen(store);
+		activeServer = running.server;
+		running.setEffectRunnerForTest(async () => ({
+			ok: true,
+			value: [{ date: '2026-06-15' }],
+		}));
+
+		const response = await fetch(`${running.baseUrl}/availability/dates`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				serviceId: service.id,
+				serviceName: service.name,
+				startDate: '2026-06-01',
+			}),
+		});
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(body).toMatchObject({
+			success: true,
+			data: [{ date: '2026-06-15' }],
+		});
+
+		await new Promise((resolve) => setImmediate(resolve));
+		const readyJobs = await store.listReadyJobs(10);
+
+		expect(readyJobs).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: 'availability_dates_refresh',
+					command: expect.objectContaining({
+						serviceId: service.id,
+						month: '2026-07',
+					}),
+				}),
+				expect.objectContaining({
+					kind: 'availability_slots_refresh',
+					command: expect.objectContaining({
+						serviceId: service.id,
+						date: '2026-06-15',
+					}),
+				}),
+			]),
+		);
 	});
 });

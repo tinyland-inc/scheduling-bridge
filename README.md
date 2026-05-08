@@ -82,9 +82,13 @@ dashboard state when `/health` is available.
 |----------|----------|---------|-------------|
 | `PORT` | No | `3001` | Server port |
 | `ACUITY_BASE_URL` | No | `https://example.as.me` | Acuity scheduling page URL |
-| `BRIDGE_DATABASE_URL` | For async K8s runtime | -- | Postgres queue/snapshot store for async jobs |
+| `BRIDGE_DATABASE_URL` | For strict async runtime | -- | Postgres queue/snapshot store for async jobs; takes precedence over Redis |
 | `BRIDGE_DATABASE_SSL` | No | `false` | Enable SSL for `BRIDGE_DATABASE_URL` |
 | `BRIDGE_DATABASE_MIGRATE` | No | `true` | Run async queue/snapshot schema creation at startup |
+| `REDIS_URL` | For K8s read cache / Redis async runtime | -- | Redis read cache plus async queue/snapshot store when `BRIDGE_DATABASE_URL` is unset |
+| `REDIS_PASSWORD` | No | -- | Password for `REDIS_URL` |
+| `BRIDGE_REDIS_ASYNC_PREFIX` | No | `bridge-async:v1` | Redis key prefix for async jobs and snapshots |
+| `BRIDGE_INLINE_WORKER_ENABLED` | No | `true` when Postgres or Redis is configured | Drain async jobs inside the HTTP container; set `false` only when a separate worker deployment is active |
 | `BRIDGE_WORKER_POLL_MS` | No | `1000` | Worker queue poll interval |
 | `BRIDGE_WORKER_BATCH_SIZE` | No | `5` | Maximum jobs drained per worker poll |
 | `AUTH_TOKEN` | Recommended | -- | Bearer token for all endpoints (except /health) |
@@ -96,6 +100,7 @@ dashboard state when `/health` is available.
 | `SERVICES_JSON` | No | -- | Optional static service catalog to bypass live Acuity reads |
 | `ACUITY_SERVICE_CACHE_TTL_MS` | No | `300000` | TTL for cached live service catalogs before BUSINESS/scraper refresh |
 | `ACUITY_URL_READ_NETWORK_IDLE_MS` | No | `1500` | Bounded post-navigation network-idle settle for direct URL availability reads; set `0` to skip |
+| `ACUITY_DATE_PREWARM_MONTHS` | No | `1` | Number of future months queued for async date refresh after a successful date read; max `3`, set `0` to disable |
 | `ACUITY_SLOT_PREWARM_LIMIT` | No | `1` | Number of first available dates to warm in the slots cache after a successful Acuity dates read; max `3`, set `0` to disable |
 | `SCHEDULING_BRIDGE_SLOT_PROFILE_THRESHOLD_MS` | No | `1500` | Threshold in ms for logging long-tail slot-read profile events |
 | `SCHEDULING_BRIDGE_PROFILE_SLOT_READS` | No | `false` | Force logging of slot-read profile events even when under threshold |

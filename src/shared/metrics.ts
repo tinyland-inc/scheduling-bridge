@@ -219,7 +219,14 @@ export const recordAvailabilitySnapshotRead = (
 
 export const recordAvailabilityHeartbeatJob = (
 	kind: string,
-	action: 'enqueued' | 'skipped_fresh' | 'skipped_limit',
+	action:
+		| 'queued'
+		| 'deduped'
+		| 'requeued'
+		| 'skipped_fresh'
+		| 'skipped_limit'
+		| 'skipped_terminal'
+		| 'requeue_failed',
 ): void => {
 	availabilityHeartbeatJobsTotal.inc({ kind, action });
 };

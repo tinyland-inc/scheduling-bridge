@@ -182,6 +182,7 @@ export interface AvailabilityHeartbeatJob {
 	readonly operationId: string;
 	readonly status: BridgeJobStatus;
 	readonly statusUrl: string;
+	readonly action: 'queued' | 'deduped' | 'requeued';
 	readonly kind: AvailabilitySnapshotKind;
 	readonly serviceId: string;
 	readonly scope: string;
@@ -193,9 +194,12 @@ export interface AvailabilityHeartbeatSkipped {
 	readonly kind: AvailabilitySnapshotKind;
 	readonly serviceId: string;
 	readonly scope: string;
-	readonly reason: 'fresh' | 'limit';
+	readonly reason: 'fresh' | 'limit' | 'terminal' | 'requeue_failed';
 	readonly freshness?: 'fresh';
 	readonly weight: number;
+	readonly status?: BridgeJobStatus;
+	readonly operationId?: string;
+	readonly statusUrl?: string;
 }
 
 export interface AvailabilityHeartbeatResponse {

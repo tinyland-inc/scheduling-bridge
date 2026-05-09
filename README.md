@@ -94,7 +94,10 @@ cold. The handler skips fresh durable snapshots, enqueues stale/expired/missing
 date and slot refresh jobs up to `maxJobs`, and uses a time-windowed idempotency
 key so frequent cron runs do not create duplicate job storms. It does not run
 browser automation on the HTTP request path; the async worker owns the Acuity
-read.
+read. If an idempotency key resolves to a retryable failed job, heartbeat
+requeues that existing operation before reporting it as work; non-retryable
+terminal jobs are reported under `skipped` instead of masquerading as newly
+enqueued refreshes.
 
 ### Health Contract
 

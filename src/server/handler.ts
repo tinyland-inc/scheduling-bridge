@@ -93,6 +93,7 @@ import type {
 	BridgeAdapterProfile,
 	BridgeJobCommand,
 	BridgeJobRecord,
+	BridgeJobStatus,
 	EnqueueBridgeJobResponse,
 } from '../async/types.js';
 import { createAcuityBridgeJobExecutor, runBridgeWorkerLoop } from './worker.js';
@@ -771,6 +772,16 @@ const toEnqueueResponse = (job: BridgeJobRecord): EnqueueBridgeJobResponse => ({
 	status: job.status,
 	statusUrl: jobStatusUrl(job.operationId),
 });
+
+const heartbeatRunnableStatuses = new Set<BridgeJobStatus>([
+	'queued',
+	'leased',
+	'running',
+]);
+
+const isRetryableHeartbeatFailure = (record: BridgeJobRecord): boolean =>
+	(record.status === 'failed_pre_submit' || record.status === 'reconcile_required') &&
+	record.failure?.retryable === true;
 
 const sendAccepted = <T>(res: ServerResponse, data: T) => sendJson(res, 202, { success: true, data });
 
@@ -1664,12 +1675,47 @@ const handleAvailabilityHeartbeat = async (req: IncomingMessage, res: ServerResp
 			candidate.scope,
 			idempotencyBucket,
 		].join(':');
-		const record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
-		recordAvailabilityHeartbeatJob(candidate.kind, 'enqueued');
+		let record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
+		let action: AvailabilityHeartbeatJob['action'] = 'queued';
+		if (isRetryableHeartbeatFailure(record)) {
+			const requeued = await bridgeAsyncStore.requeueJob(record.operationId);
+			if (!requeued) {
+				recordAvailabilityHeartbeatJob(candidate.kind, 'requeue_failed');
+				skipped.push({
+					kind: candidate.kind,
+					serviceId: candidate.serviceId,
+					scope: candidate.scope,
+					reason: 'requeue_failed',
+					weight: candidate.weight,
+					status: record.status,
+					operationId: record.operationId,
+					statusUrl: jobStatusUrl(record.operationId),
+				});
+				continue;
+			}
+			record = requeued;
+			action = 'requeued';
+		}
+		if (!heartbeatRunnableStatuses.has(record.status)) {
+			recordAvailabilityHeartbeatJob(candidate.kind, 'skipped_terminal');
+			skipped.push({
+				kind: candidate.kind,
+				serviceId: candidate.serviceId,
+				scope: candidate.scope,
+				reason: 'terminal',
+				weight: candidate.weight,
+				status: record.status,
+				operationId: record.operationId,
+				statusUrl: jobStatusUrl(record.operationId),
+			});
+			continue;
+		}
+		recordAvailabilityHeartbeatJob(candidate.kind, action);
 		enqueued.push({
 			operationId: record.operationId,
 			status: record.status,
 			statusUrl: jobStatusUrl(record.operationId),
+			action,
 			kind: candidate.kind,
 			serviceId: candidate.serviceId,
 			scope: candidate.scope,

@@ -143,9 +143,9 @@ describe('bridge read cache metrics wiring', () => {
 			return snap.values.find((v) => v.labels.kind === kind && v.labels.action === action)?.value ?? 0;
 		};
 
-		const before = await heartbeatCounter('dates', 'enqueued');
-		recordAvailabilityHeartbeatJob('dates', 'enqueued');
-		const after = await heartbeatCounter('dates', 'enqueued');
+		const before = await heartbeatCounter('dates', 'queued');
+		recordAvailabilityHeartbeatJob('dates', 'queued');
+		const after = await heartbeatCounter('dates', 'queued');
 		expect(after).toBe(before + 1);
 	});
 });

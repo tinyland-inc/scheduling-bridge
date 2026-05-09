@@ -567,6 +567,118 @@ describe('bridge async protocol endpoints', () => {
 		await expect(store.listReadyJobs(10)).resolves.toHaveLength(2);
 	});
 
+	it('requeues retryable heartbeat idempotency hits instead of reporting failed records as enqueued', async () => {
+		process.env.AUTH_TOKEN = 'heartbeat-token';
+		const store = createInMemoryBridgeAsyncStore();
+		const running = await listen(store);
+		activeServer = running.server;
+		const url = `${running.baseUrl}/internal/availability/heartbeat`;
+		const payload = {
+			maxJobs: 1,
+			idempotencyWindowMs: 60_000,
+			idempotencyKeyPrefix: 'test-heartbeat-retry',
+			demands: [
+				{
+					serviceId: 'svc-retry',
+					serviceName: 'Retryable service',
+					weight: 10,
+					months: ['2026-06'],
+				},
+			],
+		};
+
+		const firstResponse = await fetch(url, {
+			method: 'POST',
+			headers: {
+				Authorization: 'Bearer heartbeat-token',
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(payload),
+		});
+		const first = await firstResponse.json();
+		const operationId = first.data.enqueued[0].operationId as string;
+
+		expect(firstResponse.status).toBe(202);
+		expect(first.data.enqueued).toMatchObject([
+			{
+				operationId,
+				status: 'queued',
+				action: 'queued',
+				kind: 'dates',
+				serviceId: 'svc-retry',
+				scope: '2026-06',
+			},
+		]);
+
+		await store.failJob(operationId, {
+			status: 'failed_pre_submit',
+			code: 'NETWORK',
+			message: 'Browser error: PAGE_FAILED',
+			step: 'refresh-availability-dates',
+			retryable: true,
+		});
+
+		const retryResponse = await fetch(url, {
+			method: 'POST',
+			headers: {
+				Authorization: 'Bearer heartbeat-token',
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(payload),
+		});
+		const retry = await retryResponse.json();
+
+		expect(retryResponse.status).toBe(202);
+		expect(retry.data.enqueued).toMatchObject([
+			{
+				operationId,
+				status: 'queued',
+				action: 'requeued',
+				kind: 'dates',
+				serviceId: 'svc-retry',
+				scope: '2026-06',
+			},
+		]);
+		await expect(store.listReadyJobs(10)).resolves.toMatchObject([
+			{
+				operationId,
+				status: 'queued',
+			},
+		]);
+
+		await store.failJob(operationId, {
+			status: 'failed_pre_submit',
+			code: 'PAYMENT_BYPASS_NOT_PROVEN',
+			message: 'Non-retryable failure',
+			step: 'bypass-payment',
+			retryable: false,
+		});
+
+		const terminalResponse = await fetch(url, {
+			method: 'POST',
+			headers: {
+				Authorization: 'Bearer heartbeat-token',
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(payload),
+		});
+		const terminal = await terminalResponse.json();
+
+		expect(terminalResponse.status).toBe(202);
+		expect(terminal.data.enqueued).toEqual([]);
+		expect(terminal.data.skipped).toEqual([
+			expect.objectContaining({
+				operationId,
+				reason: 'terminal',
+				status: 'failed_pre_submit',
+				kind: 'dates',
+				serviceId: 'svc-retry',
+				scope: '2026-06',
+			}),
+		]);
+		await expect(store.listReadyJobs(10)).resolves.toHaveLength(0);
+	});
+
 	it('fairly interleaves equal-priority heartbeat demand across services', async () => {
 		process.env.AUTH_TOKEN = 'heartbeat-token';
 		const store = createInMemoryBridgeAsyncStore();

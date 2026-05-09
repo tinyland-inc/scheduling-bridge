@@ -120,6 +120,33 @@ describe("runBridgeReadCached", () => {
     expect(await mock.get("lock:failed-slot-key")).toBeNull();
   });
 
+  it("can skip caching successful values", async () => {
+    const read = vi.fn(async () => ({
+      ok: true as const,
+      value: [{ datetime: "stale-snapshot" }],
+    }));
+
+    const result = await runBridgeReadCached({
+      redisClient: mock as unknown as BridgeReadCacheClient,
+      cacheKind: "availability_slots",
+      cacheKey: "uncached-slot-key",
+      ttlSeconds: 60,
+      emptyTtlSeconds: 10,
+      read,
+      shouldCache: () => false,
+      log: (event) => events.push(event),
+      waitTimeoutMs: 1000,
+      pollIntervalMs: 10,
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      value: [{ datetime: "stale-snapshot" }],
+    });
+    expect(await mock.get("uncached-slot-key")).toBeNull();
+    expect(await mock.get("lock:uncached-slot-key")).toBeNull();
+  });
+
   it("falls through when the single-flight winner does not publish before the wait budget", async () => {
     await mock.set("lock:slow-slot-key", "winner-token", "PX", 30_000, "NX");
     const read = vi.fn(async () => ({

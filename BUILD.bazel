@@ -162,7 +162,7 @@ npm_package(
     ],
     package = "@tummycrypt/scheduling-bridge",
     tags = ["manual"],
-    version = "0.5.2",
+    version = "0.5.3",
     visibility = ["//visibility:public"],
 )
 

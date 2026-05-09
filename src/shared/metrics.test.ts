@@ -7,6 +7,7 @@ import {
 	observePageOpEffect,
 	recordCacheHit,
 	recordCacheMiss,
+	recordAvailabilitySnapshotServed,
 	renderMetrics,
 	trackBrowserSession,
 } from './metrics.js';
@@ -26,6 +27,7 @@ describe('metrics', () => {
 		expect(names).toContain('acuity_bridge_read_cache_events_total');
 		expect(names).toContain('acuity_bridge_read_cache_wait_duration_seconds');
 		expect(names).toContain('acuity_bridge_read_duration_seconds');
+		expect(names).toContain('acuity_availability_snapshot_served_total');
 	});
 
 	it('renders Prometheus text format', async () => {
@@ -47,44 +49,30 @@ describe('metrics', () => {
 		// Delta assertion — registry is a module-level singleton so absolute
 		// values accumulate across tests. Pin the +1 rather than trust state.
 		const before =
-			(await metrics.serviceCatalogScrapeTotal.get()).values.find(
-				(v) => v.labels.source === 'lock_winner',
-			)?.value ?? 0;
+			(await metrics.serviceCatalogScrapeTotal.get()).values.find((v) => v.labels.source === 'lock_winner')?.value ?? 0;
 		metrics.serviceCatalogScrapeTotal.inc({ source: 'lock_winner' });
 		const after =
-			(await metrics.serviceCatalogScrapeTotal.get()).values.find(
-				(v) => v.labels.source === 'lock_winner',
-			)?.value ?? 0;
+			(await metrics.serviceCatalogScrapeTotal.get()).values.find((v) => v.labels.source === 'lock_winner')?.value ?? 0;
 		expect(after).toBe(before + 1);
 	});
 });
 
 describe('bridge read cache metrics wiring', () => {
-	const counterValue = async (
-		cacheKind: string,
-		event: string,
-	): Promise<number> => {
+	const counterValue = async (cacheKind: string, event: string): Promise<number> => {
 		const snap = await metrics.bridgeReadCacheEventsTotal.get();
-		return snap.values.find(
-			(v) =>
-				v.labels.cache_kind === cacheKind &&
-				v.labels.event === event,
-		)?.value ?? 0;
+		return snap.values.find((v) => v.labels.cache_kind === cacheKind && v.labels.event === event)?.value ?? 0;
 	};
 
-	const histogramCount = async (
-		metricName: string,
-		labels: Record<string, string>,
-	): Promise<number> => {
+	const histogramCount = async (metricName: string, labels: Record<string, string>): Promise<number> => {
 		const metric = metrics.registry.getSingleMetric(metricName);
 		const snap = await metric?.get();
 		const countName = `${metricName}_count`;
-		return snap?.values.find((v) => {
-			if (v.metricName !== countName) return false;
-			return Object.entries(labels).every(
-				([key, value]) => v.labels[key] === value,
-			);
-		})?.value ?? 0;
+		return (
+			snap?.values.find((v) => {
+				if (v.metricName !== countName) return false;
+				return Object.entries(labels).every(([key, value]) => v.labels[key] === value);
+			})?.value ?? 0
+		);
 	};
 
 	it('increments fixed-label cache event counters', async () => {
@@ -95,28 +83,38 @@ describe('bridge read cache metrics wiring', () => {
 	});
 
 	it('records wait duration samples by outcome', async () => {
-		const before = await histogramCount(
-			'acuity_bridge_read_cache_wait_duration_seconds',
-			{ cache_kind: 'availability_slots', outcome: 'hit' },
-		);
+		const before = await histogramCount('acuity_bridge_read_cache_wait_duration_seconds', {
+			cache_kind: 'availability_slots',
+			outcome: 'hit',
+		});
 		metrics.recordBridgeReadCacheWait('availability_slots', 'hit', 250);
-		const after = await histogramCount(
-			'acuity_bridge_read_cache_wait_duration_seconds',
-			{ cache_kind: 'availability_slots', outcome: 'hit' },
-		);
+		const after = await histogramCount('acuity_bridge_read_cache_wait_duration_seconds', {
+			cache_kind: 'availability_slots',
+			outcome: 'hit',
+		});
 		expect(after).toBe(before + 1);
 	});
 
 	it('records uncached bridge read duration samples', async () => {
-		const before = await histogramCount(
-			'acuity_bridge_read_duration_seconds',
-			{ cache_kind: 'availability_dates' },
-		);
+		const before = await histogramCount('acuity_bridge_read_duration_seconds', {
+			cache_kind: 'availability_dates',
+		});
 		await metrics.observeBridgeRead('availability_dates', async () => 42);
-		const after = await histogramCount(
-			'acuity_bridge_read_duration_seconds',
-			{ cache_kind: 'availability_dates' },
-		);
+		const after = await histogramCount('acuity_bridge_read_duration_seconds', {
+			cache_kind: 'availability_dates',
+		});
+		expect(after).toBe(before + 1);
+	});
+
+	it('increments snapshot-served counters by kind and freshness', async () => {
+		const snapshotCounter = async (kind: string, freshness: string): Promise<number> => {
+			const snap = await metrics.availabilitySnapshotServedTotal.get();
+			return snap.values.find((v) => v.labels.kind === kind && v.labels.freshness === freshness)?.value ?? 0;
+		};
+
+		const before = await snapshotCounter('slots', 'stale');
+		recordAvailabilitySnapshotServed('slots', 'stale');
+		const after = await snapshotCounter('slots', 'stale');
 		expect(after).toBe(before + 1);
 	});
 });
@@ -132,10 +130,7 @@ describe('browser page limiter metrics wiring', () => {
 		const snap = await metrics.browserPageAcquireDuration.get();
 		return (
 			snap.values.find(
-				(v) =>
-					v.metricName ===
-						'acuity_browser_page_acquire_duration_seconds_count' &&
-					v.labels.outcome === outcome,
+				(v) => v.metricName === 'acuity_browser_page_acquire_duration_seconds_count' && v.labels.outcome === outcome,
 			)?.value ?? 0
 		);
 	};
@@ -206,8 +201,7 @@ describe('pageOperationsDuration wiring', () => {
 			const snap = await metrics.pageOperationsDuration.get();
 			// `_count` lines have `metricName: <name>_count` and the matching operation label.
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
-					v.labels.operation === op,
+				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' && v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
 		};
@@ -222,8 +216,7 @@ describe('pageOperationsDuration wiring', () => {
 		const bucketCountFor = async (op: string): Promise<number> => {
 			const snap = await metrics.pageOperationsDuration.get();
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
-					v.labels.operation === op,
+				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' && v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
 		};
@@ -242,8 +235,7 @@ describe('pageOperationsDuration wiring', () => {
 		const bucketCountFor = async (op: string): Promise<number> => {
 			const snap = await metrics.pageOperationsDuration.get();
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
-					v.labels.operation === op,
+				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' && v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
 		};
@@ -271,9 +263,11 @@ describe('browserActiveSessions wiring', () => {
 			trackBrowserSession(
 				Effect.sync(() => {
 					// Synchronous peek while the session is "held".
-					const row = (metrics.browserActiveSessions as unknown as {
-						hashMap: Map<string, { value: number }>;
-					}).hashMap;
+					const row = (
+						metrics.browserActiveSessions as unknown as {
+							hashMap: Map<string, { value: number }>;
+						}
+					).hashMap;
 					// Fallback to prom-client async snapshot if the internal
 					// structure changes in future versions.
 					void row;
@@ -289,9 +283,7 @@ describe('browserActiveSessions wiring', () => {
 
 	it('decrements even when the wrapped Effect fails', async () => {
 		const baseline = await gaugeValue();
-		await expect(
-			Effect.runPromise(trackBrowserSession(Effect.fail('nope' as never))),
-		).rejects.toBeDefined();
+		await expect(Effect.runPromise(trackBrowserSession(Effect.fail('nope' as never)))).rejects.toBeDefined();
 		expect(await gaugeValue()).toBe(baseline);
 	});
 

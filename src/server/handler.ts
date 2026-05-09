@@ -53,11 +53,8 @@ import {
 	type ServiceCatalogRedisL2,
 } from '../shared/acuity-service-catalog.js';
 import { getCached as redisL2GetCached, RedisL2 } from '../shared/redis-l2.js';
-import {
-	runBridgeReadCached,
-	type BridgeReadCacheClient,
-} from '../shared/bridge-read-cache.js';
-import { metrics, renderMetrics } from '../shared/metrics.js';
+import { runBridgeReadCached, type BridgeReadCacheClient } from '../shared/bridge-read-cache.js';
+import { metrics, recordAvailabilitySnapshotServed, renderMetrics } from '../shared/metrics.js';
 import { toSchedulingError, type MiddlewareError } from '../adapters/acuity/errors.js';
 import {
 	navigateToBooking,
@@ -70,46 +67,25 @@ import {
 	readAvailableDates,
 	readTimeSlots,
 } from '../adapters/acuity/steps/index.js';
-import {
-	readDatesViaUrl,
-	readSlotsViaUrl,
-} from '../adapters/acuity/steps/read-via-url.js';
+import { readDatesViaUrl, readSlotsViaUrl } from '../adapters/acuity/steps/read-via-url.js';
 import { buildHealthPayload } from './health.js';
 import { handleReady as _handleReady } from './ready.js';
-import {
-	buildAvailabilityDatesCacheKey,
-	getDatePrewarmMonths,
-	selectDatePrewarmMonths,
-} from './date-prewarm.js';
-import {
-	buildAvailabilitySlotsCacheKey,
-	getSlotPrewarmLimit,
-	selectSlotPrewarmDates,
-} from './slot-prewarm.js';
+import { buildAvailabilityDatesCacheKey, getDatePrewarmMonths, selectDatePrewarmMonths } from './date-prewarm.js';
+import { buildAvailabilitySlotsCacheKey, getSlotPrewarmLimit, selectSlotPrewarmDates } from './slot-prewarm.js';
 import { ndjsonLog } from '../shared/logger.js';
-import {
-	createInMemoryBridgeAsyncStore,
-	type BridgeAsyncStore,
-} from '../async/store.js';
+import { createInMemoryBridgeAsyncStore, type BridgeAsyncStore } from '../async/store.js';
 import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
 import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
 import type {
+	AvailabilitySnapshot,
 	AvailabilitySnapshotKind,
 	BridgeAdapterProfile,
 	BridgeJobCommand,
 	BridgeJobRecord,
 	EnqueueBridgeJobResponse,
 } from '../async/types.js';
-import {
-	createAcuityBridgeJobExecutor,
-	runBridgeWorkerLoop,
-} from './worker.js';
-import type {
-	Booking,
-	BookingRequest,
-	Service,
-	SchedulingError,
-} from '../core/types.js';
+import { createAcuityBridgeJobExecutor, runBridgeWorkerLoop } from './worker.js';
+import type { Booking, BookingRequest, AvailableDate, Service, SchedulingError, TimeSlot } from '../core/types.js';
 import { Errors } from '../core/types.js';
 
 const acuitySteps = {
@@ -126,9 +102,7 @@ const acuitySteps = {
 	readSlotsViaUrl,
 };
 
-export const __setAcuityStepOverridesForTest = (
-	overrides: Partial<typeof acuitySteps>,
-) => {
+export const __setAcuityStepOverridesForTest = (overrides: Partial<typeof acuitySteps>) => {
 	Object.assign(acuitySteps, overrides);
 };
 
@@ -204,8 +178,7 @@ const sendJson = (res: ServerResponse, status: number, body: SuccessResponse<unk
 	res.end(JSON.stringify(body));
 };
 
-const sendSuccess = <T>(res: ServerResponse, data: T) =>
-	sendJson(res, 200, { success: true, data });
+const sendSuccess = <T>(res: ServerResponse, data: T) => sendJson(res, 200, { success: true, data });
 
 const sendError = (res: ServerResponse, status: number, err: SchedulingError) =>
 	sendJson(res, status, {
@@ -254,23 +227,14 @@ const runtimeLogFields = () => ({
 	releaseVersion: process.env.MIDDLEWARE_RELEASE_VERSION ?? process.env.npm_package_version,
 });
 
-const logEvent = (
-	level: LogLevel,
-	msg: string,
-	data?: Record<string, unknown>,
-) => {
+const logEvent = (level: LogLevel, msg: string, data?: Record<string, unknown>) => {
 	ndjsonLog(level, msg, {
 		...runtimeLogFields(),
 		...data,
 	});
 };
 
-const logRequestEvent = (
-	level: LogLevel,
-	msg: string,
-	context: RequestContext,
-	data?: Record<string, unknown>,
-) => {
+const logRequestEvent = (level: LogLevel, msg: string, context: RequestContext, data?: Record<string, unknown>) => {
 	logEvent(level, msg, {
 		event: 'request',
 		requestId: context.requestId,
@@ -308,10 +272,7 @@ const createServiceCatalogLogger = () => ({
 		}),
 });
 
-const createSlotReadTelemetryContext = (
-	context: RequestContext,
-	endpoint: string,
-) => ({
+const createSlotReadTelemetryContext = (context: RequestContext, endpoint: string) => ({
 	requestId: context.requestId,
 	endpoint,
 	...runtimeLogFields(),
@@ -325,9 +286,7 @@ const browserRuntime = ManagedRuntime.make(BrowserProcessLive(browserConfig));
 
 type Result<A> = { ok: true; value: A } | { ok: false; error: SchedulingError };
 
-const exitToResult = <A>(
-	exit: Exit.Exit<A, MiddlewareError | undefined>,
-): Result<A> => {
+const exitToResult = <A>(exit: Exit.Exit<A, MiddlewareError | undefined>): Result<A> => {
 	if (Exit.isSuccess(exit)) {
 		return { ok: true, value: exit.value };
 	}
@@ -335,7 +294,14 @@ const exitToResult = <A>(
 	if (failure._tag === 'Some' && failure.value !== undefined) {
 		return { ok: false, error: toSchedulingError(failure.value) };
 	}
-	return { ok: false, error: { _tag: 'InfrastructureError', code: 'UNKNOWN', message: Cause.pretty(exit.cause) } };
+	return {
+		ok: false,
+		error: {
+			_tag: 'InfrastructureError',
+			code: 'UNKNOWN',
+			message: Cause.pretty(exit.cause),
+		},
+	};
 };
 
 type RunEffect = <A>(
@@ -345,9 +311,7 @@ type RunEffect = <A>(
 const runEffectWithBrowser: RunEffect = async <A>(
 	effect: Effect.Effect<A, MiddlewareError | undefined, BrowserService | Scope.Scope>,
 ): Promise<Result<A>> => {
-	const exit = await browserRuntime.runPromiseExit(
-		Effect.scoped(effect.pipe(Effect.provide(BrowserSessionLive))),
-	);
+	const exit = await browserRuntime.runPromiseExit(Effect.scoped(effect.pipe(Effect.provide(BrowserSessionLive))));
 	return exitToResult(exit);
 };
 
@@ -356,9 +320,7 @@ let runEffect: RunEffect = runEffectWithBrowser;
 export const __runEffectWithoutBrowserForTest: RunEffect = async <A>(
 	effect: Effect.Effect<A, MiddlewareError | undefined, BrowserService | Scope.Scope>,
 ): Promise<Result<A>> => {
-	const exit = await Effect.runPromiseExit(
-		effect as Effect.Effect<A, MiddlewareError | undefined, never>,
-	);
+	const exit = await Effect.runPromiseExit(effect as Effect.Effect<A, MiddlewareError | undefined, never>);
 	return exitToResult(exit);
 };
 
@@ -420,11 +382,7 @@ if (redisClient) {
 
 const serviceCatalogRedisL2: ServiceCatalogRedisL2 | undefined = redisClient
 	? {
-			getCached: <A>(
-				key: string,
-				ttlSeconds: number,
-				mk: Effect.Effect<A>,
-			): Effect.Effect<A> => {
+			getCached: <A>(key: string, ttlSeconds: number, mk: Effect.Effect<A>): Effect.Effect<A> => {
 				const mkPromise = (): Promise<A> => Effect.runPromise(mk);
 				// Provide the RedisL2 service for the real `getCached`, then erase
 				// the `RedisError | CacheTimeoutError` channel so the result fits
@@ -503,14 +461,10 @@ const startInlineWorker = () => {
 	if (!BRIDGE_INLINE_WORKER_ENABLED || inlineWorkerAbortController) return;
 	inlineWorkerAbortController = new AbortController();
 	const workerId = `${process.env.HOSTNAME ?? `pid-${process.pid}`}:inline`;
-	void runBridgeWorkerLoop(
-		bridgeAsyncStore,
-		createAcuityBridgeJobExecutor({ redisClient }),
-		{
-			workerId,
-			signal: inlineWorkerAbortController.signal,
-		},
-	).catch((error) => {
+	void runBridgeWorkerLoop(bridgeAsyncStore, createAcuityBridgeJobExecutor({ redisClient }), {
+		workerId,
+		signal: inlineWorkerAbortController.signal,
+	}).catch((error) => {
 		if (inlineWorkerAbortController?.signal.aborted) return;
 		logEvent('ERROR', 'Inline bridge worker failed', {
 			event: 'bridge_inline_worker_failed',
@@ -546,8 +500,7 @@ const isSchedulingError = (error: unknown): error is SchedulingError =>
 const isRecord = (value: unknown): value is Record<string, unknown> =>
 	typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const isNonEmptyString = (value: unknown): value is string =>
-	typeof value === 'string' && value.trim().length > 0;
+const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 
 const optionalString = (value: unknown): string | undefined | null => {
 	if (value === undefined) return undefined;
@@ -559,6 +512,7 @@ const runCachedBridgeRead = async <A>(
 	cacheKind: string,
 	cacheKey: string,
 	read: () => Promise<Result<A>>,
+	shouldCache?: (value: A) => boolean,
 ): Promise<Result<A>> => {
 	return runBridgeReadCached({
 		redisClient: redisClient as BridgeReadCacheClient | null,
@@ -570,24 +524,17 @@ const runCachedBridgeRead = async <A>(
 		waitTimeoutMs: READ_CACHE_WAIT_TIMEOUT_MS,
 		waitTimeoutResult: (waitMs) => ({
 			ok: false,
-			error: Errors.infrastructure(
-				'TIMEOUT',
-				`Timed out after ${waitMs}ms waiting for ${cacheKind} cache fill`,
-			),
+			error: Errors.infrastructure('TIMEOUT', `Timed out after ${waitMs}ms waiting for ${cacheKind} cache fill`),
 		}),
 		read,
+		shouldCache,
 		log: ({ event, cacheKind, waitMs, error }) => {
-			logRequestEvent(
-				error ? 'ERROR' : 'INFO',
-				'Bridge read cache event',
-				context,
-				{
-					event,
-					cacheKind,
-					...(waitMs === undefined ? {} : { waitMs }),
-					...(error === undefined ? {} : { error: describeLogValue(error) }),
-				},
-			);
+			logRequestEvent(error ? 'ERROR' : 'INFO', 'Bridge read cache event', context, {
+				event,
+				cacheKind,
+				...(waitMs === undefined ? {} : { waitMs }),
+				...(error === undefined ? {} : { error: describeLogValue(error) }),
+			});
 		},
 	});
 };
@@ -615,8 +562,7 @@ const adapterProfile = (): BridgeAdapterProfile => ({
 	adminApiConfigured: process.env.ACUITY_ADMIN_API_CONFIGURED === 'true',
 });
 
-const jobStatusUrl = (operationId: string): string =>
-	`/jobs/${encodeURIComponent(operationId)}`;
+const jobStatusUrl = (operationId: string): string => `/jobs/${encodeURIComponent(operationId)}`;
 
 const toEnqueueResponse = (job: BridgeJobRecord): EnqueueBridgeJobResponse => ({
 	operationId: job.operationId,
@@ -624,8 +570,7 @@ const toEnqueueResponse = (job: BridgeJobRecord): EnqueueBridgeJobResponse => ({
 	statusUrl: jobStatusUrl(job.operationId),
 });
 
-const sendAccepted = <T>(res: ServerResponse, data: T) =>
-	sendJson(res, 202, { success: true, data });
+const sendAccepted = <T>(res: ServerResponse, data: T) => sendJson(res, 202, { success: true, data });
 
 const snapshotTimestamps = (observedAt = new Date()) => {
 	const staleAfterMs = Number(process.env.BRIDGE_SNAPSHOT_STALE_MS ?? 5 * 60_000);
@@ -673,52 +618,119 @@ const enqueueAvailabilityPrewarmJob = (
 		readonly scope: string;
 	},
 ) => {
-	const idempotencyKey = [
-		'availability-prewarm',
-		ACUITY_BASE_URL,
-		options.kind,
-		options.serviceId,
-		options.scope,
-	].join(':');
+	const idempotencyKey = ['availability-prewarm', ACUITY_BASE_URL, options.kind, options.serviceId, options.scope].join(
+		':',
+	);
 
-	const job: BridgeJobCommand = options.kind === 'dates'
-		? {
-				kind: 'availability_dates_refresh',
-				command: {
-					serviceId: options.serviceId,
-					serviceName: options.serviceName,
-					month: options.scope,
-					adapterProfile: adapterProfile(),
-				},
-			}
-		: {
-				kind: 'availability_slots_refresh',
-				command: {
-					serviceId: options.serviceId,
-					serviceName: options.serviceName,
-					date: options.scope,
-					adapterProfile: adapterProfile(),
-				},
-			};
+	const job: BridgeJobCommand =
+		options.kind === 'dates'
+			? {
+					kind: 'availability_dates_refresh',
+					command: {
+						serviceId: options.serviceId,
+						serviceName: options.serviceName,
+						month: options.scope,
+						adapterProfile: adapterProfile(),
+					},
+				}
+			: {
+					kind: 'availability_slots_refresh',
+					command: {
+						serviceId: options.serviceId,
+						serviceName: options.serviceName,
+						date: options.scope,
+						adapterProfile: adapterProfile(),
+					},
+				};
 
-	void bridgeAsyncStore.enqueueJob(job, { idempotencyKey }).then((record) => {
-		logRequestEvent('INFO', 'Availability prewarm job enqueued', context, {
-			event: 'availability_prewarm_job_enqueued',
-			operationId: record.operationId,
-			status: record.status,
+	void bridgeAsyncStore
+		.enqueueJob(job, { idempotencyKey })
+		.then((record) => {
+			logRequestEvent('INFO', 'Availability prewarm job enqueued', context, {
+				event: 'availability_prewarm_job_enqueued',
+				operationId: record.operationId,
+				status: record.status,
+				kind: options.kind,
+				serviceId: options.serviceId,
+				scope: options.scope,
+			});
+		})
+		.catch((error) => {
+			logRequestEvent('WARN', 'Availability prewarm enqueue failed', context, {
+				event: 'availability_prewarm_enqueue_failed',
+				kind: options.kind,
+				serviceId: options.serviceId,
+				scope: options.scope,
+				error: describeLogValue(error),
+			});
+		});
+};
+
+type AvailabilitySnapshotFreshness = 'fresh' | 'stale' | 'expired';
+
+const classifyAvailabilitySnapshotFreshness = (
+	snapshot: AvailabilitySnapshot,
+	now = new Date(),
+): AvailabilitySnapshotFreshness => {
+	const nowMs = now.getTime();
+	const expiresAtMs = Date.parse(snapshot.expiresAt);
+	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+		return 'expired';
+	}
+
+	const staleAtMs = Date.parse(snapshot.staleAt);
+	return Number.isFinite(staleAtMs) && staleAtMs > nowMs ? 'fresh' : 'stale';
+};
+
+const readUsableAvailabilitySnapshot = async <A extends readonly unknown[]>(
+	context: RequestContext,
+	options: {
+		readonly kind: AvailabilitySnapshotKind;
+		readonly serviceId: string;
+		readonly serviceName?: string;
+		readonly scope: string;
+	},
+): Promise<Result<A> | null> => {
+	try {
+		const snapshot = await bridgeAsyncStore.getAvailabilitySnapshot({
 			kind: options.kind,
 			serviceId: options.serviceId,
 			scope: options.scope,
+			baseUrl: ACUITY_BASE_URL,
 		});
-	}).catch((error) => {
-		logRequestEvent('WARN', 'Availability prewarm enqueue failed', context, {
-			event: 'availability_prewarm_enqueue_failed',
+		if (!snapshot) return null;
+
+		const freshness = classifyAvailabilitySnapshotFreshness(snapshot);
+		logRequestEvent('INFO', 'Availability snapshot considered', context, {
+			event: 'availability_snapshot_considered',
+			kind: options.kind,
+			serviceId: options.serviceId,
+			scope: options.scope,
+			freshness,
+			version: snapshot.version,
+			observedAt: snapshot.observedAt,
+			staleAt: snapshot.staleAt,
+			expiresAt: snapshot.expiresAt,
+		});
+
+		if (freshness === 'expired') return null;
+
+		recordAvailabilitySnapshotServed(options.kind, freshness);
+		if (freshness === 'stale') {
+			enqueueAvailabilityPrewarmJob(context, options);
+		}
+
+		return { ok: true, value: snapshot.value as A };
+	} catch (error) {
+		logRequestEvent('WARN', 'Availability snapshot read failed', context, {
+			event: 'availability_snapshot_read_failed',
 			kind: options.kind,
 			serviceId: options.serviceId,
 			scope: options.scope,
 			error: describeLogValue(error),
 		});
-	});
+		return null;
+	}
 };
 
 const scheduleDatePrewarm = (
@@ -793,13 +805,9 @@ const handleReady = (res: ServerResponse) =>
 	_handleReady(res, {
 		redisPing: redisClient ? () => redisClient!.ping() : null,
 		browserConnected: () =>
-			browserRuntime.runPromise(
-				BrowserProcess.pipe(Effect.map(({ browser }) => browser.isConnected())),
-			),
+			browserRuntime.runPromise(BrowserProcess.pipe(Effect.map(({ browser }) => browser.isConnected()))),
 		catalogL1Count: () => serviceCatalog.getCachedCount(),
-		catalogL2Exists: redisClient
-			? () => redisClient!.exists(CATALOG_REDIS_KEY)
-			: null,
+		catalogL2Exists: redisClient ? () => redisClient!.exists(CATALOG_REDIS_KEY) : null,
 		catalogWarm: async () => (await serviceCatalog.getServices()).length,
 	});
 
@@ -820,7 +828,6 @@ const handleHealth = (_req: IncomingMessage, res: ServerResponse) => {
 		}),
 	);
 };
-
 
 const handleGetServices = async (_req: IncomingMessage, res: ServerResponse) => {
 	try {
@@ -847,7 +854,11 @@ const handleGetService = async (serviceId: string, res: ServerResponse) => {
 		if (!found) {
 			return sendJson(res, 404, {
 				success: false,
-				error: { tag: 'AcuityError', code: 'NOT_FOUND', message: `Service ${serviceId} not found` },
+				error: {
+					tag: 'AcuityError',
+					code: 'NOT_FOUND',
+					message: `Service ${serviceId} not found`,
+				},
 			});
 		}
 		sendSuccess(res, found);
@@ -887,30 +898,47 @@ const handleAvailableDates = async (req: IncomingMessage, res: ServerResponse, c
 		serviceName: body.serviceName,
 		startDate: body.startDate,
 	});
-	const cacheKey = buildAvailabilityDatesCacheKey(
-		ACUITY_BASE_URL,
-		body.serviceId,
-		targetMonth ?? 'current',
-	);
-	const result = await runCachedBridgeRead(context, 'availability_dates', cacheKey, () =>
-		isAcuityAppointmentTypeId(body.serviceId)
-			? runEffect(acuitySteps.readDatesViaUrl(body.serviceId, targetMonth))
-			: (async () => {
-				const serviceName = await resolveServiceName(body.serviceId, body.serviceName);
-				logRequestEvent('INFO', 'Availability dates resolved service name', context, {
-					event: 'availability_dates_resolved_service',
-					serviceId: body.serviceId,
-					serviceName,
-					startDate: body.startDate,
-				});
-				return runEffect(
-					acuitySteps.readAvailableDates({
+	const cacheKey = buildAvailabilityDatesCacheKey(ACUITY_BASE_URL, body.serviceId, targetMonth ?? 'current');
+	let observedFreshAvailability = false;
+	let cacheReadResult = true;
+	const result = await runCachedBridgeRead(
+		context,
+		'availability_dates',
+		cacheKey,
+		async () => {
+			const snapshot = await readUsableAvailabilitySnapshot<readonly AvailableDate[]>(context, {
+				kind: 'dates',
+				serviceId: body.serviceId,
+				serviceName: body.serviceName,
+				scope: targetMonth ?? 'current',
+			});
+			if (snapshot) {
+				cacheReadResult = false;
+				return snapshot;
+			}
+
+			observedFreshAvailability = true;
+			cacheReadResult = true;
+			return isAcuityAppointmentTypeId(body.serviceId)
+				? runEffect(acuitySteps.readDatesViaUrl(body.serviceId, targetMonth))
+				: (async () => {
+					const serviceName = await resolveServiceName(body.serviceId, body.serviceName);
+					logRequestEvent('INFO', 'Availability dates resolved service name', context, {
+						event: 'availability_dates_resolved_service',
+						serviceId: body.serviceId,
 						serviceName,
-						targetMonth,
-						monthsToScan: 2,
-					}),
-				);
-			})(),
+						startDate: body.startDate,
+					});
+					return runEffect(
+						acuitySteps.readAvailableDates({
+							serviceName,
+							targetMonth,
+							monthsToScan: 2,
+						}),
+					);
+				})();
+		},
+		() => cacheReadResult,
 	);
 
 	if (!result.ok) {
@@ -925,16 +953,22 @@ const handleAvailableDates = async (req: IncomingMessage, res: ServerResponse, c
 		});
 		return sendJson(res, 500, {
 			success: false,
-			error: { tag: err._tag ?? 'InfrastructureError', code: 'code' in err ? (err as {code:string}).code : 'UNKNOWN', message: 'message' in err ? (err as {message:string}).message : 'Availability lookup failed' },
+			error: {
+				tag: err._tag ?? 'InfrastructureError',
+				code: 'code' in err ? (err as { code: string }).code : 'UNKNOWN',
+				message: 'message' in err ? (err as { message: string }).message : 'Availability lookup failed',
+			},
 		});
 	}
-	await recordAvailabilitySnapshot(
-		'dates',
-		body.serviceId,
-		targetMonth ?? 'current',
-		Array.isArray(result.value) ? result.value : [],
-		context,
-	);
+	if (observedFreshAvailability) {
+		await recordAvailabilitySnapshot(
+			'dates',
+			body.serviceId,
+			targetMonth ?? 'current',
+			Array.isArray(result.value) ? result.value : [],
+			context,
+		);
+	}
 	scheduleDatePrewarm(context, body.serviceId, body.serviceName, targetMonth);
 	scheduleSlotPrewarm(context, body.serviceId, body.serviceName, result.value);
 	sendSuccess(res, result.value);
@@ -952,7 +986,11 @@ const handleAvailableSlots = async (req: IncomingMessage, res: ServerResponse, c
 	if (serviceName === null) {
 		return sendValidationError(res, 'serviceName', 'serviceName must be a string');
 	}
-	const body = { serviceId: rawBody.serviceId, serviceName, date: rawBody.date };
+	const body = {
+		serviceId: rawBody.serviceId,
+		serviceName,
+		date: rawBody.date,
+	};
 	logRequestEvent('INFO', 'Availability slots requested', context, {
 		event: 'availability_slots_requested',
 		serviceId: body.serviceId,
@@ -960,30 +998,51 @@ const handleAvailableSlots = async (req: IncomingMessage, res: ServerResponse, c
 		date: body.date,
 	});
 	const cacheKey = buildAvailabilitySlotsCacheKey(ACUITY_BASE_URL, body.serviceId, body.date);
-	const result = await runCachedBridgeRead(context, 'availability_slots', cacheKey, () =>
-		isAcuityAppointmentTypeId(body.serviceId)
-			? runEffect(
-				acuitySteps.readSlotsViaUrl(
-					body.serviceId,
-					body.date,
-					createSlotReadTelemetryContext(context, 'availability_slots'),
-				),
-			)
+	let observedFreshAvailability = false;
+	let cacheReadResult = true;
+	const result = await runCachedBridgeRead(
+		context,
+		'availability_slots',
+		cacheKey,
+		async () => {
+			const snapshot = await readUsableAvailabilitySnapshot<readonly TimeSlot[]>(context, {
+				kind: 'slots',
+				serviceId: body.serviceId,
+				serviceName: body.serviceName,
+				scope: body.date,
+			});
+			if (snapshot) {
+				cacheReadResult = false;
+				return snapshot;
+			}
+
+			observedFreshAvailability = true;
+			cacheReadResult = true;
+			return isAcuityAppointmentTypeId(body.serviceId)
+				? runEffect(
+					acuitySteps.readSlotsViaUrl(
+						body.serviceId,
+						body.date,
+						createSlotReadTelemetryContext(context, 'availability_slots'),
+					),
+				)
 			: (async () => {
-				const serviceName = await resolveServiceName(body.serviceId, body.serviceName);
-				logRequestEvent('INFO', 'Availability slots resolved service name', context, {
-					event: 'availability_slots_resolved_service',
-					serviceId: body.serviceId,
-					serviceName,
-					date: body.date,
-				});
-				return runEffect(
-					acuitySteps.readTimeSlots({
+					const serviceName = await resolveServiceName(body.serviceId, body.serviceName);
+					logRequestEvent('INFO', 'Availability slots resolved service name', context, {
+						event: 'availability_slots_resolved_service',
+						serviceId: body.serviceId,
 						serviceName,
 						date: body.date,
-					}),
-				);
-			})(),
+					});
+					return runEffect(
+						acuitySteps.readTimeSlots({
+							serviceName,
+							date: body.date,
+						}),
+					);
+				})();
+		},
+		() => cacheReadResult,
 	);
 
 	if (!result.ok) {
@@ -998,21 +1057,31 @@ const handleAvailableSlots = async (req: IncomingMessage, res: ServerResponse, c
 		});
 		return sendJson(res, 500, {
 			success: false,
-			error: { tag: err._tag ?? 'InfrastructureError', code: 'code' in err ? (err as {code:string}).code : 'UNKNOWN', message: 'message' in err ? (err as {message:string}).message : 'Slot lookup failed' },
+			error: {
+				tag: err._tag ?? 'InfrastructureError',
+				code: 'code' in err ? (err as { code: string }).code : 'UNKNOWN',
+				message: 'message' in err ? (err as { message: string }).message : 'Slot lookup failed',
+			},
 		});
 	}
-	await recordAvailabilitySnapshot(
-		'slots',
-		body.serviceId,
-		body.date,
-		Array.isArray(result.value) ? result.value : [],
-		context,
-	);
+	if (observedFreshAvailability) {
+		await recordAvailabilitySnapshot(
+			'slots',
+			body.serviceId,
+			body.date,
+			Array.isArray(result.value) ? result.value : [],
+			context,
+		);
+	}
 	sendSuccess(res, result.value);
 };
 
 const handleCheckSlot = async (req: IncomingMessage, res: ServerResponse, context: RequestContext) => {
-	const body = (await parseBody(req)) as { serviceId: string; serviceName?: string; datetime: string };
+	const body = (await parseBody(req)) as {
+		serviceId: string;
+		serviceName?: string;
+		datetime: string;
+	};
 	const date = body.datetime.split('T')[0];
 	logRequestEvent('INFO', 'Availability check requested', context, {
 		event: 'availability_check_requested',
@@ -1050,17 +1119,24 @@ const handleCheckSlot = async (req: IncomingMessage, res: ServerResponse, contex
 		});
 		return sendJson(res, 500, {
 			success: false,
-			error: { tag: err._tag ?? 'InfrastructureError', code: 'code' in err ? (err as {code:string}).code : 'UNKNOWN', message: 'message' in err ? (err as {message:string}).message : 'Slot check failed' },
+			error: {
+				tag: err._tag ?? 'InfrastructureError',
+				code: 'code' in err ? (err as { code: string }).code : 'UNKNOWN',
+				message: 'message' in err ? (err as { message: string }).message : 'Slot check failed',
+			},
 		});
 	}
-	const available = result.value.some((s: { datetime: string; available: boolean }) =>
-		s.datetime === body.datetime && s.available
+	const available = result.value.some(
+		(s: { datetime: string; available: boolean }) => s.datetime === body.datetime && s.available,
 	);
 	sendSuccess(res, available);
 };
 
 const handleCreateBooking = async (req: IncomingMessage, res: ServerResponse, context: RequestContext) => {
-	const body = (await parseBody(req)) as { request: BookingRequest; couponCode?: string };
+	const body = (await parseBody(req)) as {
+		request: BookingRequest;
+		couponCode?: string;
+	};
 	const { request } = body;
 
 	const serviceName = await resolveServiceName(request.serviceId);
@@ -1078,7 +1154,10 @@ const handleCreateBooking = async (req: IncomingMessage, res: ServerResponse, co
 				client: request.client,
 				appointmentTypeId: request.serviceId,
 			});
-			yield* acuitySteps.fillFormFields({ client: request.client, customFields: request.client.customFields });
+			yield* acuitySteps.fillFormFields({
+				client: request.client,
+				customFields: request.client.customFields,
+			});
 			yield* acuitySteps.submitBooking();
 			const confirmation = yield* acuitySteps.extractConfirmation();
 			return acuitySteps.toBooking(confirmation, request, '', 'acuity');
@@ -1109,11 +1188,7 @@ const handleDeprecatedSyncPaymentBooking = (res: ServerResponse) =>
 		},
 	});
 
-const handleEnqueueBookingJob = async (
-	req: IncomingMessage,
-	res: ServerResponse,
-	context: RequestContext,
-) => {
+const handleEnqueueBookingJob = async (req: IncomingMessage, res: ServerResponse, context: RequestContext) => {
 	const rawBody = await parseBody(req);
 	if (!isRecord(rawBody)) {
 		return sendValidationError(res, 'body', 'Request body must be an object');
@@ -1133,7 +1208,11 @@ const handleEnqueueBookingJob = async (
 	if (couponBypassRequired && !coupon) {
 		return sendJson(res, 400, {
 			success: false,
-			error: { tag: 'ValidationError', code: 'couponCode', message: 'Coupon code is required for payment bypass' },
+			error: {
+				tag: 'ValidationError',
+				code: 'couponCode',
+				message: 'Coupon code is required for payment bypass',
+			},
 		});
 	}
 	const idempotencyKey = optionalString(rawBody.idempotencyKey) ?? undefined;
@@ -1166,11 +1245,7 @@ const handleEnqueueBookingJob = async (
 	return sendAccepted(res, toEnqueueResponse(record));
 };
 
-const handleEnqueueAvailabilityRefresh = async (
-	req: IncomingMessage,
-	res: ServerResponse,
-	context: RequestContext,
-) => {
+const handleEnqueueAvailabilityRefresh = async (req: IncomingMessage, res: ServerResponse, context: RequestContext) => {
 	const rawBody = await parseBody(req);
 	if (!isRecord(rawBody)) {
 		return sendValidationError(res, 'body', 'Request body must be an object');
@@ -1201,33 +1276,30 @@ const handleEnqueueAvailabilityRefresh = async (
 		return sendValidationError(res, 'date', 'date is required for slot refresh jobs');
 	}
 
-	const idempotencyKey = idempotencyKeyOverride ?? [
-		'availability-refresh',
-		ACUITY_BASE_URL,
-		kind,
-		rawBody.serviceId,
-		kind === 'dates' ? month : date,
-	].join(':');
+	const idempotencyKey =
+		idempotencyKeyOverride ??
+		['availability-refresh', ACUITY_BASE_URL, kind, rawBody.serviceId, kind === 'dates' ? month : date].join(':');
 
-	const job: BridgeJobCommand = kind === 'dates'
-		? {
-				kind: 'availability_dates_refresh',
-				command: {
-					serviceId: rawBody.serviceId,
-					serviceName,
-					month: month as string,
-					adapterProfile: adapterProfile(),
-				},
-			}
-		: {
-				kind: 'availability_slots_refresh',
-				command: {
-					serviceId: rawBody.serviceId,
-					serviceName,
-					date: date as string,
-					adapterProfile: adapterProfile(),
-				},
-			};
+	const job: BridgeJobCommand =
+		kind === 'dates'
+			? {
+					kind: 'availability_dates_refresh',
+					command: {
+						serviceId: rawBody.serviceId,
+						serviceName,
+						month: month as string,
+						adapterProfile: adapterProfile(),
+					},
+				}
+			: {
+					kind: 'availability_slots_refresh',
+					command: {
+						serviceId: rawBody.serviceId,
+						serviceName,
+						date: date as string,
+						adapterProfile: adapterProfile(),
+					},
+				};
 
 	const record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
 
@@ -1247,16 +1319,17 @@ const handleGetAsyncJob = async (operationId: string, res: ServerResponse) => {
 	if (!record) {
 		return sendJson(res, 404, {
 			success: false,
-			error: { tag: 'InfrastructureError', code: 'NOT_FOUND', message: `Job ${operationId} not found` },
+			error: {
+				tag: 'InfrastructureError',
+				code: 'NOT_FOUND',
+				message: `Job ${operationId} not found`,
+			},
 		});
 	}
 	return sendSuccess(res, record);
 };
 
-const handleGetAvailabilitySnapshot = async (
-	url: URL,
-	res: ServerResponse,
-) => {
+const handleGetAvailabilitySnapshot = async (url: URL, res: ServerResponse) => {
 	const kind = url.searchParams.get('kind');
 	const serviceId = url.searchParams.get('serviceId');
 	const scope = url.searchParams.get('scope');
@@ -1329,7 +1402,11 @@ const server = createServer(async (req, res) => {
 			});
 			return sendJson(res, 401, {
 				success: false,
-				error: { tag: 'InfrastructureError', code: 'UNAUTHORIZED', message: 'Invalid auth token' },
+				error: {
+					tag: 'InfrastructureError',
+					code: 'UNAUTHORIZED',
+					message: 'Invalid auth token',
+				},
 			});
 		}
 	}
@@ -1398,7 +1475,11 @@ const server = createServer(async (req, res) => {
 		});
 		sendJson(res, 404, {
 			success: false,
-			error: { tag: 'InfrastructureError', code: 'NOT_FOUND', message: `Unknown route: ${method} ${path}` },
+			error: {
+				tag: 'InfrastructureError',
+				code: 'NOT_FOUND',
+				message: `Unknown route: ${method} ${path}`,
+			},
 		});
 	} catch (e) {
 		logRequestEvent('ERROR', 'Unhandled request error', context, {

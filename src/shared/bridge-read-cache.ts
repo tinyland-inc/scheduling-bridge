@@ -36,6 +36,7 @@ export interface RunBridgeReadCachedOptions<A, E> {
   readonly ttlSeconds: number;
   readonly emptyTtlSeconds: number;
   readonly read: () => Promise<BridgeReadResult<A, E>>;
+  readonly shouldCache?: (value: A) => boolean;
   readonly log?: (event: BridgeReadCacheEvent) => void;
   readonly lockTtlMs?: number;
   readonly waitTimeoutMs?: number;
@@ -92,6 +93,7 @@ export const runBridgeReadCached = async <A, E>({
   ttlSeconds,
   emptyTtlSeconds,
   read,
+  shouldCache,
   log,
   lockTtlMs = BRIDGE_READ_CACHE_DEFAULTS.lockTtlMs,
   waitTimeoutMs = BRIDGE_READ_CACHE_DEFAULTS.waitTimeoutMs,
@@ -140,6 +142,7 @@ export const runBridgeReadCached = async <A, E>({
       record("lock_winner");
       const result = await observeRead();
       if (!result.ok) return result;
+      if (shouldCache && !shouldCache(result.value)) return result;
 
       try {
         await writeCached(

@@ -25,11 +25,7 @@ const bookingRequest = {
 };
 
 const listen = async (store = createInMemoryBridgeAsyncStore()) => {
-	const {
-		server,
-		__setBridgeAsyncStoreForTest,
-		__setEffectRunnerForTest,
-	} = await import('../handler.js');
+	const { server, __setBridgeAsyncStoreForTest, __setEffectRunnerForTest } = await import('../handler.js');
 	__setBridgeAsyncStoreForTest(store);
 	await new Promise<void>((resolve) => {
 		server.listen(0, '127.0.0.1', resolve);
@@ -178,6 +174,163 @@ describe('bridge async protocol endpoints', () => {
 				scope: '2026-06',
 				value: [{ date: '2026-06-15' }],
 			},
+		});
+	});
+
+	it('serves fresh date snapshots on the availability request path', async () => {
+		const store = createInMemoryBridgeAsyncStore();
+		await store.upsertAvailabilitySnapshot({
+			kind: 'dates',
+			serviceId: service.id,
+			scope: '2026-06',
+			adapterProfile: {
+				backend: 'acuity',
+				baseUrl: 'https://example.as.me',
+			},
+			value: [{ date: '2026-06-15' }],
+			observedAt: '2999-01-01T00:00:00.000Z',
+			staleAt: '2999-01-01T00:05:00.000Z',
+			expiresAt: '2999-01-01T00:30:00.000Z',
+		});
+		const running = await listen(store);
+		activeServer = running.server;
+		const runner = vi.fn(async () => ({
+			ok: false as const,
+			error: {
+				_tag: 'InfrastructureError' as const,
+				code: 'UNEXPECTED_BROWSER_READ',
+				message: 'browser read should not run',
+			},
+		}));
+		running.setEffectRunnerForTest(runner);
+
+		const response = await fetch(`${running.baseUrl}/availability/dates`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				serviceId: service.id,
+				serviceName: service.name,
+				startDate: '2026-06-01',
+			}),
+		});
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(body).toMatchObject({
+			success: true,
+			data: [{ date: '2026-06-15' }],
+		});
+		expect(runner).not.toHaveBeenCalled();
+	});
+
+	it('serves stale slot snapshots and queues async refresh', async () => {
+		const store = createInMemoryBridgeAsyncStore();
+		await store.upsertAvailabilitySnapshot({
+			kind: 'slots',
+			serviceId: service.id,
+			scope: '2026-06-15',
+			adapterProfile: {
+				backend: 'acuity',
+				baseUrl: 'https://example.as.me',
+			},
+			value: [{ time: '4:00 PM', datetime: '2026-06-15T16:00:00-04:00' }],
+			observedAt: '2000-01-01T00:00:00.000Z',
+			staleAt: '2000-01-01T00:01:00.000Z',
+			expiresAt: '2999-01-01T00:30:00.000Z',
+		});
+		const running = await listen(store);
+		activeServer = running.server;
+		const runner = vi.fn(async () => ({
+			ok: false as const,
+			error: {
+				_tag: 'InfrastructureError' as const,
+				code: 'UNEXPECTED_BROWSER_READ',
+				message: 'browser read should not run',
+			},
+		}));
+		running.setEffectRunnerForTest(runner);
+
+		const response = await fetch(`${running.baseUrl}/availability/slots`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				serviceId: service.id,
+				serviceName: service.name,
+				date: '2026-06-15',
+			}),
+		});
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(body).toMatchObject({
+			success: true,
+			data: [{ time: '4:00 PM', datetime: '2026-06-15T16:00:00-04:00' }],
+		});
+		expect(runner).not.toHaveBeenCalled();
+
+		await new Promise((resolve) => setImmediate(resolve));
+		await expect(store.listReadyJobs(10)).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: 'availability_slots_refresh',
+					command: expect.objectContaining({
+						serviceId: service.id,
+						date: '2026-06-15',
+					}),
+				}),
+			]),
+		);
+	});
+
+	it('ignores expired request-path snapshots and refreshes from Acuity', async () => {
+		const store = createInMemoryBridgeAsyncStore();
+		await store.upsertAvailabilitySnapshot({
+			kind: 'dates',
+			serviceId: service.id,
+			scope: '2026-08',
+			adapterProfile: {
+				backend: 'acuity',
+				baseUrl: 'https://example.as.me',
+			},
+			value: [{ date: '2026-08-01' }],
+			observedAt: '2000-01-01T00:00:00.000Z',
+			staleAt: '2000-01-01T00:01:00.000Z',
+			expiresAt: '2000-01-01T00:30:00.000Z',
+		});
+		const running = await listen(store);
+		activeServer = running.server;
+		const runner = vi.fn(async () => ({
+			ok: true as const,
+			value: [{ date: '2026-08-15' }],
+		}));
+		running.setEffectRunnerForTest(runner);
+
+		const response = await fetch(`${running.baseUrl}/availability/dates`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				serviceId: service.id,
+				serviceName: service.name,
+				startDate: '2026-08-01',
+			}),
+		});
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(body).toMatchObject({
+			success: true,
+			data: [{ date: '2026-08-15' }],
+		});
+		expect(runner).toHaveBeenCalledTimes(1);
+		await expect(
+			store.getAvailabilitySnapshot({
+				kind: 'dates',
+				serviceId: service.id,
+				scope: '2026-08',
+				baseUrl: 'https://example.as.me',
+			}),
+		).resolves.toMatchObject({
+			value: [{ date: '2026-08-15' }],
 		});
 	});
 

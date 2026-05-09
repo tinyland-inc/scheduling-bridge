@@ -48,6 +48,13 @@ HTTP Request
 | POST | `/booking/jobs` | Enqueue async paid booking job |
 | GET | `/jobs/:operationId` | Read async job status |
 
+Availability date/slot request handlers are snapshot-first after Redis read-cache
+misses: a fresh durable snapshot returns immediately, a stale-but-not-expired
+snapshot returns immediately and queues an async refresh, and an expired/missing
+snapshot falls through to the Acuity read path. Serving a stale snapshot does
+not re-stamp it as freshly observed; only successful Acuity reads or worker
+refresh jobs advance snapshot freshness.
+
 ### Health Contract
 
 `GET /health` is the stable downstream runtime-truth surface.
@@ -91,6 +98,8 @@ dashboard state when `/health` is available.
 | `BRIDGE_INLINE_WORKER_ENABLED` | No | `true` when Postgres or Redis is configured | Drain async jobs inside the HTTP container; set `false` only when a separate worker deployment is active |
 | `BRIDGE_WORKER_POLL_MS` | No | `1000` | Worker queue poll interval |
 | `BRIDGE_WORKER_BATCH_SIZE` | No | `5` | Maximum jobs drained per worker poll |
+| `BRIDGE_SNAPSHOT_STALE_MS` | No | `300000` | Age after which a durable availability snapshot is served stale and refresh is queued |
+| `BRIDGE_SNAPSHOT_EXPIRES_MS` | No | `1800000` | Age after which a durable availability snapshot is ignored and a live Acuity read is required |
 | `AUTH_TOKEN` | Recommended | -- | Bearer token for all endpoints (except /health) |
 | `ACUITY_BYPASS_COUPON` | For payment bypass | -- | 100% gift certificate code |
 | `PLAYWRIGHT_HEADLESS` | No | `true` | Run browser headless |

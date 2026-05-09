@@ -1,11 +1,5 @@
 import { Effect } from 'effect';
-import {
-	Counter,
-	Gauge,
-	Histogram,
-	Registry,
-	collectDefaultMetrics,
-} from 'prom-client';
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 /**
  * Prometheus metrics registry for the acuity-middleware bridge.
@@ -105,6 +99,13 @@ const bridgeReadDuration = new Histogram({
 	registers: [registry],
 });
 
+const availabilitySnapshotServedTotal = new Counter({
+	name: 'acuity_availability_snapshot_served_total',
+	help: 'Availability snapshots served on the request path by kind and freshness',
+	labelNames: ['kind', 'freshness'],
+	registers: [registry],
+});
+
 // ─── Derived cache hit-ratio ─────────────────────────────────────────────────
 //
 // `cacheHitRatio` is a derived gauge — prom-client cannot compute it for us,
@@ -156,52 +157,37 @@ export const _resetCacheHitRatioForTests = (): void => {
 	cacheHitRatio.set(1);
 };
 
-export const recordBridgeReadCacheEvent = (
-	cacheKind: string,
-	event: string,
-): void => {
+export const recordBridgeReadCacheEvent = (cacheKind: string, event: string): void => {
 	bridgeReadCacheEventsTotal.inc({ cache_kind: cacheKind, event });
 };
 
-export const setBrowserPageLimiterState = (
-	active: number,
-	queued: number,
-): void => {
+export const setBrowserPageLimiterState = (active: number, queued: number): void => {
 	browserPageLimiterActive.set(Math.max(0, active));
 	browserPageLimiterQueued.set(Math.max(0, queued));
 };
 
-export const recordBrowserPageAcquire = (
-	outcome: 'success' | 'timeout',
-	waitMs: number,
-): void => {
+export const recordBrowserPageAcquire = (outcome: 'success' | 'timeout', waitMs: number): void => {
 	browserPageAcquireDuration.observe({ outcome }, Math.max(0, waitMs) / 1000);
 	if (outcome === 'timeout') {
 		browserPageAcquireTimeoutsTotal.inc();
 	}
 };
 
-export const recordBridgeReadCacheWait = (
-	cacheKind: string,
-	outcome: 'hit' | 'timeout',
-	waitMs: number,
-): void => {
-	bridgeReadCacheWaitDuration.observe(
-		{ cache_kind: cacheKind, outcome },
-		Math.max(0, waitMs) / 1000,
-	);
+export const recordBridgeReadCacheWait = (cacheKind: string, outcome: 'hit' | 'timeout', waitMs: number): void => {
+	bridgeReadCacheWaitDuration.observe({ cache_kind: cacheKind, outcome }, Math.max(0, waitMs) / 1000);
 };
 
-export const observeBridgeRead = async <A>(
-	cacheKind: string,
-	fn: () => Promise<A>,
-): Promise<A> => {
+export const observeBridgeRead = async <A>(cacheKind: string, fn: () => Promise<A>): Promise<A> => {
 	const end = bridgeReadDuration.startTimer({ cache_kind: cacheKind });
 	try {
 		return await fn();
 	} finally {
 		end();
 	}
+};
+
+export const recordAvailabilitySnapshotServed = (kind: string, freshness: 'fresh' | 'stale'): void => {
+	availabilitySnapshotServedTotal.inc({ kind, freshness });
 };
 
 // ─── Page-operation timer helper ─────────────────────────────────────────────
@@ -211,10 +197,7 @@ export const observeBridgeRead = async <A>(
 // `scrape_catalog`, `wizard_navigate`). Never label per-service_id or per-url.
 
 /** Observe a Playwright/page operation's wall time. Handles Promise success + failure. */
-export const observePageOp = async <A>(
-	operation: string,
-	fn: () => Promise<A>,
-): Promise<A> => {
+export const observePageOp = async <A>(operation: string, fn: () => Promise<A>): Promise<A> => {
 	const end = pageOperationsDuration.startTimer({ operation });
 	try {
 		return await fn();
@@ -245,9 +228,7 @@ export const observePageOpEffect = <A, E, R>(
 // combinator instead of calling `.inc()` / `.dec()` directly so the
 // release path runs even on interrupt.
 
-export const trackBrowserSession = <A, E, R>(
-	effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> =>
+export const trackBrowserSession = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
 	Effect.acquireUseRelease(
 		Effect.sync(() => browserActiveSessions.inc()),
 		() => effect,
@@ -268,6 +249,7 @@ export const metrics = {
 	bridgeReadCacheEventsTotal,
 	bridgeReadCacheWaitDuration,
 	bridgeReadDuration,
+	availabilitySnapshotServedTotal,
 	recordCacheHit,
 	recordCacheMiss,
 	setBrowserPageLimiterState,
@@ -275,6 +257,7 @@ export const metrics = {
 	recordBridgeReadCacheEvent,
 	recordBridgeReadCacheWait,
 	observeBridgeRead,
+	recordAvailabilitySnapshotServed,
 	observePageOp,
 	observePageOpEffect,
 	trackBrowserSession,

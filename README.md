@@ -89,21 +89,22 @@ weighted demand:
 }
 ```
 
-The heartbeat evaluates higher-weight demand first. Equal-weight demand is
-interleaved by service/request group before `maxJobs` is applied, so one service
-cannot consume the whole enqueue budget while same-priority services remain
-cold. The handler skips fresh durable snapshots, enqueues stale/expired/missing
-date and slot refresh jobs up to `maxJobs`, and uses a time-windowed idempotency
-key so frequent cron runs do not create duplicate job storms. It does not run
-browser automation on the HTTP request path; the async worker owns the Acuity
-read. If an idempotency key resolves to a retryable failed job, heartbeat
-requeues that existing operation before reporting it as work; non-retryable
-terminal jobs are reported under `skipped` instead of masquerading as newly
-enqueued refreshes.
+The heartbeat uses weighted fairness across service/request groups before
+`maxJobs` is applied. A higher `weight` biases additional work toward that
+demand, but every active demand group receives early representation before one
+high-weight service can consume the whole enqueue budget. Equal-weight demand is
+round-robin interleaved by request order. The handler skips fresh durable
+snapshots, enqueues stale/expired/missing date and slot refresh jobs up to
+`maxJobs`, and uses a time-windowed idempotency key so frequent cron runs do not
+create duplicate job storms. It does not run browser automation on the HTTP
+request path; the async worker owns the Acuity read. If an idempotency key
+resolves to a retryable failed job, heartbeat requeues that existing operation
+before reporting it as work; non-retryable terminal jobs are reported under
+`skipped` instead of masquerading as newly enqueued refreshes.
 
 ### Queue Hygiene
 
-Bridge `0.5.9` supports bounded worker drain concurrency through
+Bridge `0.5.10` supports bounded worker drain concurrency through
 `BRIDGE_WORKER_CONCURRENCY`. The package default remains `1`; the MassageIthaca
 K8s deployment currently opts into `2` through Blahaj/OpenTofu after proving the
 datepicker readiness gate remains green.

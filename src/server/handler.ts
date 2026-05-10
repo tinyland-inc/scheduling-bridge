@@ -677,50 +677,50 @@ interface AvailabilityHeartbeatDemandGroup {
 	readonly candidates: readonly AvailabilityHeartbeatCandidate[];
 }
 
-const interleaveEqualWeightHeartbeatGroups = (
-	groups: readonly AvailabilityHeartbeatDemandGroup[],
-): readonly AvailabilityHeartbeatCandidate[] => {
-	const interleaved: AvailabilityHeartbeatCandidate[] = [];
-	const orderedGroups = [...groups].sort((a, b) => a.order - b.order);
-	const maxLength = Math.max(
-		0,
-		...orderedGroups.map((group) => group.candidates.length),
-	);
-	for (
-		let candidateIndex = 0;
-		candidateIndex < maxLength;
-		candidateIndex += 1
-	) {
-		for (const group of orderedGroups) {
-			const candidate = group.candidates[candidateIndex];
-			if (candidate) {
-				interleaved.push(candidate);
-			}
-		}
-	}
-	return interleaved;
+interface AvailabilityHeartbeatDemandGroupCursor {
+	readonly group: AvailabilityHeartbeatDemandGroup;
+	readonly schedulingWeight: number;
+	candidateIndex: number;
+	served: number;
+}
+
+const heartbeatSchedulingWeight = (weight: number): number => {
+	if (!Number.isFinite(weight)) return 1;
+	return Math.max(1, Math.min(100, Math.floor(weight)));
 };
 
 const orderHeartbeatCandidateGroups = (
 	groups: readonly AvailabilityHeartbeatDemandGroup[],
 ): readonly AvailabilityHeartbeatCandidate[] => {
-	const orderedGroups = [...groups].sort(
-		(a, b) => b.weight - a.weight || a.order - b.order,
-	);
 	const orderedCandidates: AvailabilityHeartbeatCandidate[] = [];
-	for (let index = 0; index < orderedGroups.length; ) {
-		const weight = orderedGroups[index]?.weight ?? 0;
-		const sameWeightGroups: AvailabilityHeartbeatDemandGroup[] = [];
-		while (
-			index < orderedGroups.length &&
-			orderedGroups[index].weight === weight
-		) {
-			sameWeightGroups.push(orderedGroups[index]);
-			index += 1;
-		}
-		orderedCandidates.push(
-			...interleaveEqualWeightHeartbeatGroups(sameWeightGroups),
-		);
+	const cursors: AvailabilityHeartbeatDemandGroupCursor[] = groups
+		.filter((group) => group.candidates.length > 0)
+		.map((group) => ({
+			group,
+			schedulingWeight: heartbeatSchedulingWeight(group.weight),
+			candidateIndex: 0,
+			served: 0,
+		}));
+
+	while (cursors.some((cursor) => cursor.candidateIndex < cursor.group.candidates.length)) {
+		const next = cursors
+			.filter(
+				(cursor) => cursor.candidateIndex < cursor.group.candidates.length,
+			)
+			.sort((a, b) => {
+				const aShare = a.served / a.schedulingWeight;
+				const bShare = b.served / b.schedulingWeight;
+				return (
+					aShare - bShare ||
+					b.group.weight - a.group.weight ||
+					a.group.order - b.group.order
+				);
+			})[0];
+		const candidate = next?.group.candidates[next.candidateIndex];
+		if (!next || !candidate) break;
+		orderedCandidates.push(candidate);
+		next.candidateIndex += 1;
+		next.served += 1;
 	}
 	return orderedCandidates;
 };

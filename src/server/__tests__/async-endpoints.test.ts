@@ -903,15 +903,15 @@ describe('bridge async protocol endpoints', () => {
 					{
 						kind: 'dates',
 						serviceId: service.id,
-						scope: '2026-07',
+						scope: '2026-08',
 						freshness: 'missing',
-						weight: 10,
+						weight: 1,
 					},
 					{
-						kind: 'slots',
+						kind: 'dates',
 						serviceId: service.id,
-						scope: '2026-06-15',
-						freshness: 'expired',
+						scope: '2026-07',
+						freshness: 'missing',
 						weight: 10,
 					},
 				],
@@ -924,10 +924,11 @@ describe('bridge async protocol endpoints', () => {
 						freshness: 'fresh',
 					}),
 					expect.objectContaining({
-						kind: 'dates',
+						kind: 'slots',
 						serviceId: service.id,
-						scope: '2026-08',
+						scope: '2026-06-15',
 						reason: 'limit',
+						weight: 10,
 					}),
 				]),
 			},
@@ -940,13 +941,13 @@ describe('bridge async protocol endpoints', () => {
 				expect.objectContaining({
 					kind: 'availability_dates_refresh',
 					idempotencyKey: expect.stringContaining(
-						'test-heartbeat:https://example.as.me:dates:53178494:2026-07:',
+						'test-heartbeat:https://example.as.me:dates:53178494:2026-08:',
 					),
 				}),
 				expect.objectContaining({
-					kind: 'availability_slots_refresh',
+					kind: 'availability_dates_refresh',
 					idempotencyKey: expect.stringContaining(
-						'test-heartbeat:https://example.as.me:slots:53178494:2026-06-15:',
+						'test-heartbeat:https://example.as.me:dates:53178494:2026-07:',
 					),
 				}),
 			]),
@@ -969,18 +970,18 @@ describe('bridge async protocol endpoints', () => {
 					operationId: first.data.enqueued[0].operationId,
 					action: 'deduped',
 					kind: 'dates',
-					scope: '2026-07',
+					scope: '2026-08',
 				}),
 				expect.objectContaining({
 					operationId: first.data.enqueued[1].operationId,
 					action: 'deduped',
-					kind: 'slots',
-					scope: '2026-06-15',
+					kind: 'dates',
+					scope: '2026-07',
 				}),
 				expect.objectContaining({
 					action: 'queued',
-					kind: 'dates',
-					scope: '2026-08',
+					kind: 'slots',
+					scope: '2026-06-15',
 				}),
 			]),
 		);
@@ -1228,6 +1229,83 @@ describe('bridge async protocol endpoints', () => {
 					kind: 'availability_dates_refresh',
 					idempotencyKey: expect.stringContaining(
 						'test-heartbeat-fairness:https://example.as.me:dates:svc-c:2026-06:',
+					),
+				}),
+			]),
+		);
+	});
+
+	it('prevents high-weight heartbeat demand from monopolizing the enqueue budget', async () => {
+		process.env.AUTH_TOKEN = 'heartbeat-token';
+		const store = createInMemoryBridgeAsyncStore();
+		const running = await listen(store);
+		activeServer = running.server;
+		const url = `${running.baseUrl}/internal/availability/heartbeat`;
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: {
+				Authorization: 'Bearer heartbeat-token',
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				maxJobs: 4,
+				idempotencyWindowMs: 60_000,
+				idempotencyKeyPrefix: 'test-heartbeat-weighted-fairness',
+				demands: [
+					{
+						serviceId: 'svc-high',
+						weight: 10,
+						months: ['2026-06', '2026-07', '2026-08', '2026-09'],
+					},
+					{
+						serviceId: 'svc-low-a',
+						weight: 1,
+						months: ['2026-06', '2026-07'],
+					},
+					{
+						serviceId: 'svc-low-b',
+						weight: 1,
+						months: ['2026-06'],
+					},
+				],
+			}),
+		});
+		const body = await response.json();
+
+		expect(response.status).toBe(202);
+		expect(body.data.enqueued).toMatchObject([
+			{ kind: 'dates', serviceId: 'svc-high', scope: '2026-06', weight: 10 },
+			{ kind: 'dates', serviceId: 'svc-low-a', scope: '2026-06', weight: 1 },
+			{ kind: 'dates', serviceId: 'svc-low-b', scope: '2026-06', weight: 1 },
+			{ kind: 'dates', serviceId: 'svc-high', scope: '2026-07', weight: 10 },
+		]);
+		expect(body.data.skipped).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					serviceId: 'svc-high',
+					scope: '2026-08',
+					reason: 'limit',
+				}),
+				expect.objectContaining({
+					serviceId: 'svc-low-a',
+					scope: '2026-07',
+					reason: 'limit',
+				}),
+			]),
+		);
+		await expect(store.listReadyJobs(10)).resolves.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: 'availability_dates_refresh',
+					idempotencyKey: expect.stringContaining(
+						'test-heartbeat-weighted-fairness:https://example.as.me:dates:svc-low-a:2026-06:',
+					),
+				}),
+				expect.objectContaining({
+					kind: 'availability_dates_refresh',
+					idempotencyKey: expect.stringContaining(
+						'test-heartbeat-weighted-fairness:https://example.as.me:dates:svc-low-b:2026-06:',
 					),
 				}),
 			]),

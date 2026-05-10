@@ -10,6 +10,7 @@ import type {
 	BridgeJobResult,
 	BridgeJobStatus,
 	BridgeQueueStats,
+	BridgeQueueStatsFailedRefresh,
 	BridgeQueueStatsKindStatus,
 	EnqueueBridgeJobOptions,
 } from './types.js';
@@ -100,6 +101,18 @@ interface QueueTotalsRow {
 	oldest_queued_age_ms: string | number | null;
 }
 
+interface QueueFailedRefreshRow {
+	kind: BridgeQueueStatsFailedRefresh['kind'];
+	status: BridgeQueueStatsFailedRefresh['status'];
+	service_id: string;
+	scope: string;
+	code: string;
+	step: string | null;
+	retryable: boolean;
+	count: string | number;
+	oldest_age_ms: string | number | null;
+}
+
 const iso = (value: Date | string): string =>
 	value instanceof Date ? value.toISOString() : value;
 
@@ -147,6 +160,20 @@ const queueKindStatusFromRow = (
 ): BridgeQueueStatsKindStatus => ({
 	kind: row.kind,
 	status: row.status,
+	count: numberFromPg(row.count) ?? 0,
+	oldestAgeMs: numberFromPg(row.oldest_age_ms),
+});
+
+const queueFailedRefreshFromRow = (
+	row: QueueFailedRefreshRow,
+): BridgeQueueStatsFailedRefresh => ({
+	kind: row.kind,
+	status: row.status,
+	serviceId: row.service_id,
+	scope: row.scope,
+	code: row.code,
+	step: row.step ?? undefined,
+	retryable: row.retryable,
 	count: numberFromPg(row.count) ?? 0,
 	oldestAgeMs: numberFromPg(row.oldest_age_ms),
 });
@@ -366,7 +393,7 @@ export const createPostgresBridgeAsyncStore = (
 		},
 
 		async getQueueStats(now = new Date()): Promise<BridgeQueueStats> {
-			const [totals, buckets] = await Promise.all([
+			const [totals, buckets, failedRefreshes] = await Promise.all([
 				query<QueueTotalsRow>(
 					`
 					select
@@ -400,6 +427,27 @@ export const createPostgresBridgeAsyncStore = (
 					`,
 					[now],
 				),
+				query<QueueFailedRefreshRow>(
+					`
+					select
+						kind,
+						status,
+						command->>'serviceId' as service_id,
+						coalesce(command->>'month', command->>'date') as scope,
+						failure->>'code' as code,
+						failure->>'step' as step,
+						coalesce((failure->>'retryable')::boolean, false) as retryable,
+						count(*)::int as count,
+						extract(epoch from ($1::timestamptz - min(created_at))) * 1000 as oldest_age_ms
+					from bridge_jobs
+					where kind in ('availability_dates_refresh', 'availability_slots_refresh')
+					  and status in ('failed_pre_submit', 'reconcile_required')
+					  and failure is not null
+					group by kind, status, service_id, scope, code, step, retryable
+					order by kind, scope, code
+					`,
+					[now],
+				),
 			]);
 			const totalRow = totals.rows[0];
 			return {
@@ -408,6 +456,7 @@ export const createPostgresBridgeAsyncStore = (
 				retryableFailed: numberFromPg(totalRow?.retryable_failed) ?? 0,
 				oldestQueuedAgeMs: numberFromPg(totalRow?.oldest_queued_age_ms),
 				byKindStatus: buckets.rows.map(queueKindStatusFromRow),
+				failedRefreshes: failedRefreshes.rows.map(queueFailedRefreshFromRow),
 			};
 		},
 

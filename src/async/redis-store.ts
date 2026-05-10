@@ -9,10 +9,13 @@ import type {
 	BridgeJobRecord,
 	BridgeJobResult,
 	BridgeQueueStats,
-	BridgeQueueStatsKindStatus,
 	EnqueueBridgeJobOptions,
 } from './types.js';
 import type { BridgeAsyncStore } from './store.js';
+import {
+	DEFAULT_REDIS_ASYNC_JOB_TTL_SECONDS,
+} from './config.js';
+import { queueStatsFromJobs } from './queue-stats.js';
 
 const LUA_CAS_DEL = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -22,7 +25,6 @@ else
 end`;
 
 const DEFAULT_PREFIX = 'bridge-async:v1';
-const DEFAULT_JOB_TTL_SECONDS = 7 * 24 * 60 * 60;
 const DEFAULT_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60;
 
 export interface RedisBridgeAsyncStoreOptions {
@@ -72,10 +74,6 @@ const readJson = async <A>(client: IORedis, key: string): Promise<A | null> => {
 	return raw ? (JSON.parse(raw) as A) : null;
 };
 
-const isRetryableFailedJob = (job: BridgeJobRecord): boolean =>
-	(job.status === 'failed_pre_submit' || job.status === 'reconcile_required') &&
-	job.failure?.retryable === true;
-
 const isReadyJob = (job: BridgeJobRecord, now: Date): boolean => {
 	if (job.status === 'queued') return true;
 	if (
@@ -85,47 +83,6 @@ const isReadyJob = (job: BridgeJobRecord, now: Date): boolean => {
 		return false;
 	}
 	return Date.parse(job.leasedUntil) <= now.getTime();
-};
-
-const queueStatsFromJobs = (
-	jobs: readonly BridgeJobRecord[],
-	now = new Date(),
-): BridgeQueueStats => {
-	const buckets = new Map<string, BridgeQueueStatsKindStatus>();
-	let ready = 0;
-	let retryableFailed = 0;
-	let oldestQueuedAgeMs: number | undefined;
-
-	for (const job of jobs) {
-		const key = `${job.kind}:${job.status}`;
-		const ageMs = Math.max(0, now.getTime() - Date.parse(job.createdAt));
-		const previous = buckets.get(key);
-		buckets.set(key, {
-			kind: job.kind,
-			status: job.status,
-			count: (previous?.count ?? 0) + 1,
-			oldestAgeMs: Math.max(previous?.oldestAgeMs ?? 0, ageMs),
-		});
-		if (isReadyJob(job, now)) {
-			ready += 1;
-			oldestQueuedAgeMs = Math.max(oldestQueuedAgeMs ?? 0, ageMs);
-		}
-		if (isRetryableFailedJob(job)) {
-			retryableFailed += 1;
-		}
-	}
-
-	return {
-		total: jobs.length,
-		ready,
-		retryableFailed,
-		oldestQueuedAgeMs,
-		byKindStatus: [...buckets.values()].sort((a, b) =>
-			a.kind === b.kind
-				? a.status.localeCompare(b.status)
-				: a.kind.localeCompare(b.kind),
-		),
-	};
 };
 
 const writeJson = async <A>(
@@ -151,7 +108,8 @@ export const createRedisBridgeAsyncStore = (
 	const client =
 		options.client ?? new IORedisImpl(options.url!, options.redisOptions ?? {});
 	const prefix = options.keyPrefix ?? DEFAULT_PREFIX;
-	const jobTtlSeconds = options.jobTtlSeconds ?? DEFAULT_JOB_TTL_SECONDS;
+	const jobTtlSeconds =
+		options.jobTtlSeconds ?? DEFAULT_REDIS_ASYNC_JOB_TTL_SECONDS;
 	const snapshotTtlSeconds =
 		options.snapshotTtlSeconds ?? DEFAULT_SNAPSHOT_TTL_SECONDS;
 

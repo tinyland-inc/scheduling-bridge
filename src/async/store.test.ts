@@ -92,6 +92,16 @@ describe('BridgeAsyncStore in-memory contract', () => {
 			ready: 2,
 			retryableFailed: 1,
 		});
+		expect(stats.failedRefreshes).toEqual([{
+			kind: 'availability_slots_refresh',
+			status: 'failed_pre_submit',
+			serviceId: '53178494',
+			scope: '2026-06-16',
+			code: 'NETWORK',
+			retryable: true,
+			count: 1,
+			oldestAgeMs: expect.any(Number),
+		}]);
 		expect(stats.oldestQueuedAgeMs).toBeGreaterThanOrEqual(0);
 		expect(stats.byKindStatus).toEqual(
 			expect.arrayContaining([

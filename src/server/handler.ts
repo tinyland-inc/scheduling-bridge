@@ -113,6 +113,7 @@ import {
 } from '../async/store.js';
 import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
 import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
+import { parseRedisAsyncJobTtlSeconds } from '../async/config.js';
 import type {
 	AvailabilitySnapshot,
 	AvailabilitySnapshotKind,
@@ -577,6 +578,7 @@ const createBridgeAsyncStore = (): BridgeAsyncStore => {
 		const store = createRedisBridgeAsyncStore({
 			client: redisClient,
 			keyPrefix: process.env.BRIDGE_REDIS_ASYNC_PREFIX,
+			jobTtlSeconds: parseRedisAsyncJobTtlSeconds(),
 		});
 		void store.ready().catch((error) => {
 			logEvent('ERROR', 'Bridge async Redis store readiness failed', {

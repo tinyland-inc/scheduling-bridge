@@ -219,12 +219,31 @@ export interface BridgeQueueStatsKindStatus {
 	readonly oldestAgeMs?: number;
 }
 
+export interface BridgeQueueStatsFailedRefresh {
+	readonly kind: Extract<
+		BridgeJobKind,
+		'availability_dates_refresh' | 'availability_slots_refresh'
+	>;
+	readonly status: Extract<
+		BridgeJobStatus,
+		'failed_pre_submit' | 'reconcile_required'
+	>;
+	readonly serviceId: string;
+	readonly scope: string;
+	readonly code: string;
+	readonly step?: string;
+	readonly retryable: boolean;
+	readonly count: number;
+	readonly oldestAgeMs?: number;
+}
+
 export interface BridgeQueueStats {
 	readonly total: number;
 	readonly ready: number;
 	readonly retryableFailed: number;
 	readonly oldestQueuedAgeMs?: number;
 	readonly byKindStatus: readonly BridgeQueueStatsKindStatus[];
+	readonly failedRefreshes: readonly BridgeQueueStatsFailedRefresh[];
 }
 
 export type AvailabilityReadinessFreshness =

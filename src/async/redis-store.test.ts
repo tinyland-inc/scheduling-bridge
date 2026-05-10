@@ -130,4 +130,64 @@ describe('RedisBridgeAsyncStore', () => {
 			value: [{ date: '2026-06-16' }],
 		});
 	});
+
+	it('honors configured Redis job TTL for job and idempotency records', async () => {
+		const keyPrefix = 'test-bridge-async:ttl';
+		const store = createRedisBridgeAsyncStore({
+			client: redis as never,
+			keyPrefix,
+			jobTtlSeconds: 30,
+		});
+		await store.clear?.();
+
+		const job = await store.enqueueJob(datesJob, {
+			idempotencyKey: 'dates:53178494:2026-06',
+		});
+		const jobTtlMs = await redis.pttl(`${keyPrefix}:job:${job.operationId}`);
+		const idempotencyKeys = await redis.keys(`${keyPrefix}:idempotency:*`);
+		const idempotencyTtlMs = await redis.pttl(idempotencyKeys[0] ?? '');
+
+		expect(jobTtlMs).toBeGreaterThan(0);
+		expect(jobTtlMs).toBeLessThanOrEqual(30_000);
+		expect(idempotencyKeys).toHaveLength(1);
+		expect(idempotencyTtlMs).toBeGreaterThan(0);
+		expect(idempotencyTtlMs).toBeLessThanOrEqual(30_000);
+	});
+
+	it('reports failed refresh summaries without counting them as runnable work', async () => {
+		const store = createStore(redis);
+		const failed = await store.enqueueJob({
+			kind: 'availability_slots_refresh',
+			command: {
+				serviceId: '53178494',
+				date: '2026-06-15',
+				adapterProfile: profile,
+			},
+		});
+		await store.failJob(failed.operationId, {
+			status: 'failed_pre_submit',
+			code: 'NETWORK',
+			message: 'Browser error: PAGE_FAILED',
+			step: 'refresh-availability-slots',
+			retryable: true,
+		});
+
+		const stats = await store.getQueueStats(
+			new Date('2026-05-10T04:00:00.000Z'),
+		);
+
+		expect(stats.ready).toBe(0);
+		expect(stats.retryableFailed).toBe(1);
+		expect(stats.failedRefreshes).toEqual([{
+			kind: 'availability_slots_refresh',
+			status: 'failed_pre_submit',
+			serviceId: '53178494',
+			scope: '2026-06-15',
+			code: 'NETWORK',
+			step: 'refresh-availability-slots',
+			retryable: true,
+			count: 1,
+			oldestAgeMs: expect.any(Number),
+		}]);
+	});
 });

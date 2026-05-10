@@ -42,6 +42,7 @@ import {
 	type BridgeJobExecutor,
 } from '../async/worker.js';
 import { ndjsonLog } from '../shared/logger.js';
+import { parseRedisAsyncJobTtlSeconds } from '../async/config.js';
 
 const ACUITY_BASE_URL = process.env.ACUITY_BASE_URL ?? 'https://example.as.me';
 const BRIDGE_DATABASE_URL = process.env.BRIDGE_DATABASE_URL;
@@ -344,6 +345,7 @@ export const createWorkerStore = (): BridgeAsyncStore & {
 				maxRetriesPerRequest: 3,
 			},
 			keyPrefix: process.env.BRIDGE_REDIS_ASYNC_PREFIX,
+			jobTtlSeconds: parseRedisAsyncJobTtlSeconds(),
 		});
 	}
 	logEvent('WARN', 'Bridge worker using in-memory store', {
@@ -384,11 +386,34 @@ export const runBridgeWorkerLoop = async (
 			concurrency,
 		});
 		if (results.length > 0) {
+			const failedJobs = results
+				.filter(
+					(job) =>
+						job.status === 'failed_pre_submit' ||
+						job.status === 'reconcile_required',
+				)
+				.map((job) => ({
+					operationId: job.operationId,
+					kind: job.kind,
+					status: job.status,
+					serviceId:
+						'serviceId' in job.command ? job.command.serviceId : undefined,
+					scope:
+						'month' in job.command
+							? job.command.month
+							: 'date' in job.command
+								? job.command.date
+								: undefined,
+					code: job.failure?.code,
+					step: job.failure?.step,
+					retryable: job.failure?.retryable,
+				}));
 			logEvent('INFO', 'Bridge worker drained jobs', {
 				event: 'bridge_worker_drained_jobs',
 				workerId,
 				count: results.length,
 				statuses: results.map((job) => job.status),
+				failedJobs,
 				executionPaths: results
 					.filter((job) => job.kind === 'booking_create_with_payment')
 					.map((job) => selectBookingExecutionPath(job.command as AppointmentCommand)),

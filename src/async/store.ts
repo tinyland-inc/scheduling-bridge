@@ -7,9 +7,9 @@ import type {
 	BridgeJobRecord,
 	BridgeJobResult,
 	BridgeQueueStats,
-	BridgeQueueStatsKindStatus,
 	EnqueueBridgeJobOptions,
 } from './types.js';
+import { queueStatsFromJobs } from './queue-stats.js';
 
 export interface BridgeAsyncStore {
 	enqueueJob(
@@ -50,63 +50,6 @@ const snapshotKey = (query: AvailabilitySnapshotQuery): string =>
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 const nowIso = (now = new Date()): string => now.toISOString();
-
-const isRetryableFailedJob = (job: BridgeJobRecord): boolean =>
-	(job.status === 'failed_pre_submit' || job.status === 'reconcile_required') &&
-	job.failure?.retryable === true;
-
-const isReadyJob = (job: BridgeJobRecord, now: Date): boolean => {
-	if (job.status === 'queued') return true;
-	if (
-		(job.status !== 'leased' && job.status !== 'running') ||
-		!job.leasedUntil
-	) {
-		return false;
-	}
-	return Date.parse(job.leasedUntil) <= now.getTime();
-};
-
-const queueStatsFromJobs = (
-	jobs: readonly BridgeJobRecord[],
-	now = new Date(),
-): BridgeQueueStats => {
-	const buckets = new Map<string, BridgeQueueStatsKindStatus>();
-	let ready = 0;
-	let retryableFailed = 0;
-	let oldestQueuedAgeMs: number | undefined;
-
-	for (const job of jobs) {
-		const key = `${job.kind}:${job.status}`;
-		const ageMs = Math.max(0, now.getTime() - Date.parse(job.createdAt));
-		const previous = buckets.get(key);
-		buckets.set(key, {
-			kind: job.kind,
-			status: job.status,
-			count: (previous?.count ?? 0) + 1,
-			oldestAgeMs: Math.max(previous?.oldestAgeMs ?? 0, ageMs),
-		});
-
-		if (isReadyJob(job, now)) {
-			ready += 1;
-			oldestQueuedAgeMs = Math.max(oldestQueuedAgeMs ?? 0, ageMs);
-		}
-		if (isRetryableFailedJob(job)) {
-			retryableFailed += 1;
-		}
-	}
-
-	return {
-		total: jobs.length,
-		ready,
-		retryableFailed,
-		oldestQueuedAgeMs,
-		byKindStatus: [...buckets.values()].sort((a, b) =>
-			a.kind === b.kind
-				? a.status.localeCompare(b.status)
-				: a.kind.localeCompare(b.kind),
-		),
-	};
-};
 
 export const createInMemoryBridgeAsyncStore = (): BridgeAsyncStore => {
 	const jobs = new Map<string, BridgeJobRecord>();

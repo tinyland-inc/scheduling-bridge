@@ -300,4 +300,47 @@ describe('Bridge async worker', () => {
 			adapterProfile: profile,
 		})).toBe('browser');
 	});
+
+	it('returns failed refresh records with operation and scope data for worker logs', async () => {
+		const store = createInMemoryBridgeAsyncStore();
+		await store.enqueueJob({
+			kind: 'availability_dates_refresh',
+			command: {
+				serviceId: '53178494',
+				month: '2026-06',
+				adapterProfile: profile,
+			},
+		});
+		const failingExecutor = executor();
+		vi.mocked(failingExecutor.refreshAvailabilityDates).mockRejectedValueOnce(
+			new BridgeJobExecutionError({
+				code: 'SCRAPE_FAILED',
+				message: 'Calendar did not load within timeout',
+				step: 'refresh-availability-dates',
+				retryable: true,
+			}),
+		);
+
+		const results = await drainReadyBridgeJobs(store, failingExecutor, {
+			workerId: 'worker-a',
+			limit: 10,
+		});
+
+		expect(results).toEqual([
+			expect.objectContaining({
+				operationId: expect.any(String),
+				kind: 'availability_dates_refresh',
+				status: 'failed_pre_submit',
+				command: expect.objectContaining({
+					serviceId: '53178494',
+					month: '2026-06',
+				}),
+				failure: expect.objectContaining({
+					code: 'SCRAPE_FAILED',
+					step: 'refresh-availability-dates',
+					retryable: true,
+				}),
+			}),
+		]);
+	});
 });

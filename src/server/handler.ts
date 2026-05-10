@@ -1219,10 +1219,6 @@ const evaluateAvailabilityReadiness = async (
 	) {
 		blockers.push(`queue_oldest_age:${queue.oldestQueuedAgeMs}`);
 	}
-	if (queue.retryableFailed > 0) {
-		blockers.push(`retryable_failed_jobs:${queue.retryableFailed}`);
-	}
-
 	const ready = blockers.length === 0 && scopes.every((scope) => scope.ready);
 	recordAvailabilityReadinessCheck(ready);
 
@@ -2141,6 +2137,25 @@ const runAvailabilityHeartbeat = async (
 		let action: AvailabilityHeartbeatJob['action'] =
 			Date.parse(record.createdAt) < enqueueStartedAt ? 'deduped' : 'queued';
 		if (isRetryableHeartbeatFailure(record)) {
+			const requeued = await bridgeAsyncStore.requeueJob(record.operationId);
+			if (!requeued) {
+				recordAvailabilityHeartbeatJob(candidate.kind, 'requeue_failed');
+				skipped.push({
+					kind: candidate.kind,
+					serviceId: candidate.serviceId,
+					scope: candidate.scope,
+					reason: 'requeue_failed',
+					weight: candidate.weight,
+					status: record.status,
+					operationId: record.operationId,
+					statusUrl: jobStatusUrl(record.operationId),
+				});
+				continue;
+			}
+			record = requeued;
+			action = 'requeued';
+		}
+		if (action === 'deduped' && record.status === 'succeeded') {
 			const requeued = await bridgeAsyncStore.requeueJob(record.operationId);
 			if (!requeued) {
 				recordAvailabilityHeartbeatJob(candidate.kind, 'requeue_failed');

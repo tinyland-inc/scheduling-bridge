@@ -372,6 +372,26 @@ describe('bridge async protocol endpoints', () => {
 	it('reports availability readiness without mutating the queue', async () => {
 		process.env.AUTH_TOKEN = 'readiness-token';
 		const store = createInMemoryBridgeAsyncStore();
+		const unrelated = await store.enqueueJob({
+			kind: 'booking_create_with_payment',
+			command: {
+				request: bookingRequest,
+				paymentRef: 'pi_unrelated_retry',
+				paymentProcessor: 'stripe',
+				adapterProfile: {
+					backend: 'acuity',
+					baseUrl: 'https://example.as.me',
+				},
+				couponBypassRequired: true,
+				executionPreference: 'auto',
+			},
+		});
+		await store.failJob(unrelated.operationId, {
+			status: 'failed_pre_submit',
+			code: 'UNRELATED_RETRYABLE',
+			message: 'old unrelated retryable failure',
+			retryable: true,
+		});
 		await store.upsertAvailabilitySnapshot({
 			kind: 'dates',
 			serviceId: service.id,
@@ -454,9 +474,9 @@ describe('bridge async protocol endpoints', () => {
 					}),
 				],
 				queue: {
-					total: 0,
+					total: 1,
 					ready: 0,
-					retryableFailed: 0,
+					retryableFailed: 1,
 				},
 				blockers: [],
 			},
@@ -618,6 +638,91 @@ describe('bridge async protocol endpoints', () => {
 				status: 'queued',
 			},
 		]);
+	});
+
+	it('requeues stale terminal heartbeat work inside the same idempotency window', async () => {
+		process.env.AUTH_TOKEN = 'readiness-token';
+		const store = createInMemoryBridgeAsyncStore();
+		const idempotencyWindowMs = 60_000;
+		const bucket = Math.floor(Date.now() / idempotencyWindowMs);
+		const idempotencyKey = [
+			'test-terminal-refresh',
+			'https://example.as.me',
+			'dates',
+			service.id,
+			'2026-06',
+			bucket,
+		].join(':');
+		const existing = await store.enqueueJob(
+			{
+				kind: 'availability_dates_refresh',
+				command: {
+					serviceId: service.id,
+					serviceName: service.name,
+					month: '2026-06',
+					adapterProfile: {
+						backend: 'acuity',
+						baseUrl: 'https://example.as.me',
+					},
+				},
+			},
+			{ idempotencyKey },
+		);
+		await store.completeJob(existing.operationId, {
+			kind: 'availability_dates_refresh',
+			dates: [{ date: '2026-06-15' }],
+		});
+		await store.upsertAvailabilitySnapshot({
+			kind: 'dates',
+			serviceId: service.id,
+			scope: '2026-06',
+			adapterProfile: {
+				backend: 'acuity',
+				baseUrl: 'https://example.as.me',
+			},
+			value: [{ date: '2026-06-15' }],
+			observedAt: '2000-01-01T00:00:00.000Z',
+			staleAt: '2999-01-01T00:05:00.000Z',
+			expiresAt: '2999-01-01T00:30:00.000Z',
+		});
+		const running = await listen(store);
+		activeServer = running.server;
+
+		const response = await fetch(
+			`${running.baseUrl}/internal/availability/wait-ready`,
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer readiness-token',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					demands: [{ serviceId: service.id, months: ['2026-06'] }],
+					maxJobs: 1,
+					timeoutMs: 1,
+					pollMs: 1,
+					idempotencyWindowMs,
+					snapshotFreshnessFloorMs: 90_000,
+					idempotencyKeyPrefix: 'test-terminal-refresh',
+				}),
+			},
+		);
+		const body = await response.json();
+
+		expect(response.status).toBe(409);
+		expect(body.data.heartbeat.enqueued).toMatchObject([
+			{
+				operationId: existing.operationId,
+				action: expect.stringMatching(/^(requeued|deduped)$/),
+				kind: 'dates',
+				serviceId: service.id,
+				scope: '2026-06',
+				freshness: 'stale',
+			},
+		]);
+		await expect(store.getJob(existing.operationId)).resolves.toMatchObject({
+			status: 'queued',
+		});
 	});
 
 	it('auth-gates the internal snapshot canary and records durable snapshot layer metrics', async () => {

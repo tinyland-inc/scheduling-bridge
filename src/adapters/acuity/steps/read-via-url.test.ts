@@ -8,7 +8,12 @@ import {
 } from '../../../shared/browser-service.js';
 import {
 	dateEmptySettleTimeoutMs,
+	parsePylonCalendarIdentity,
 	readDatesViaUrl,
+	readSlotsViaUrl,
+	resolvePylonStartDate,
+	toPylonAvailabilityDates,
+	toPylonAvailabilitySlots,
 	urlReadNetworkIdleTimeoutMs,
 } from './read-via-url.js';
 
@@ -74,76 +79,43 @@ describe('date empty settle timing config', () => {
 	});
 });
 
-const monthNames = [
-	'January',
-	'February',
-	'March',
-	'April',
-	'May',
-	'June',
-	'July',
-	'August',
-	'September',
-	'October',
-	'November',
-	'December',
-] as const;
-
-const formatMonthKey = (date: Date): string =>
-	`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-
-const makeUrlDateReadPage = (
-	initialMonth: string,
-	datesByMonth: Map<string, string[]>,
-	onWaitForFunction?: () => void,
+const makePylonReadPage = (
+	payload: Record<string, Array<{ time?: string; slotsAvailable?: number }>>,
 ) => {
-	const [year, month] = initialMonth.split('-').map(Number);
-	const current = new Date(year, month - 1, 1);
-	const navClicks: string[] = [];
 	const gotoUrls: string[] = [];
-
-	const navHandle = (direction: 'prev' | 'next') => ({
-		click: vi.fn(async () => {
-			current.setMonth(current.getMonth() + (direction === 'next' ? 1 : -1));
-			navClicks.push(direction);
-		}),
-	});
+	const apiUrls: string[] = [];
+	let currentUrl =
+		'https://massageithaca.as.me/schedule/4671d709/category/X19hbGxfXw%3D%3D/appointment/53178494/calendar/8973181?appointmentTypeIds[]=53178494';
 
 	const page = {
 		goto: vi.fn(async (url: string) => {
 			gotoUrls.push(url);
 		}),
 		waitForLoadState: vi.fn(async () => undefined),
-		waitForSelector: vi.fn(async (selector: string) => {
-			if (selector.includes('prev-button')) return navHandle('prev');
-			if (selector.includes('next-button')) return navHandle('next');
-			return {};
+		url: vi.fn(() => currentUrl),
+		evaluate: vi.fn(async (_fn: unknown, url: string) => {
+			apiUrls.push(url);
+			return payload;
 		}),
-		waitForTimeout: vi.fn(async () => undefined),
-		waitForFunction: vi.fn(async () => {
-			onWaitForFunction?.();
-		}),
-		$eval: vi.fn(async () => {
-			const label = `${monthNames[current.getMonth()]} ${current.getFullYear()}`;
-			return label;
-		}),
-		evaluate: vi.fn(async () => {
-			const dates = datesByMonth.get(formatMonthKey(current)) ?? [];
-			return dates.map((date) => ({ date, slots: 1 }));
-		}),
-	} as unknown as Page;
+		__setUrl: (url: string) => {
+			currentUrl = url;
+		},
+	} as unknown as Page & { __setUrl: (url: string) => void };
 
 	return {
 		page,
 		gotoUrls,
-		navClicks,
+		apiUrls,
 	};
 };
 
-const runDateRead = (page: Page, targetMonth?: string) =>
+const provideBrowser = <A, E>(
+	page: Page,
+	effect: Effect.Effect<A, E, BrowserService>,
+) =>
 	Effect.runPromise(
 		Effect.scoped(
-			readDatesViaUrl('53178494', targetMonth).pipe(
+			effect.pipe(
 				Effect.provideService(BrowserService, {
 					acquirePage: Effect.succeed(page),
 					screenshot: () => Effect.succeed(Buffer.from('')),
@@ -157,33 +129,111 @@ const runDateRead = (page: Page, targetMonth?: string) =>
 		),
 	);
 
-describe('readDatesViaUrl DOM behavior', () => {
-	it('waits for enabled dates before returning an empty month', async () => {
-		const datesByMonth = new Map<string, string[]>([['2026-07', []]]);
-		const fake = makeUrlDateReadPage('2026-07', datesByMonth, () => {
-			datesByMonth.set('2026-07', ['2026-07-15']);
-		});
+const runDateRead = (page: Page, targetMonth?: string) =>
+	provideBrowser(page, readDatesViaUrl('53178494', targetMonth));
 
-		const dates = await runDateRead(fake.page);
+const runSlotRead = (page: Page, date: string) =>
+	provideBrowser(page, readSlotsViaUrl('53178494', date));
 
-		expect(dates).toEqual([{ date: '2026-07-15', slots: 1 }]);
-		expect(fake.page.evaluate).toHaveBeenCalledTimes(2);
-		expect(fake.page.waitForFunction).toHaveBeenCalledTimes(1);
+describe('Acuity pylon availability helpers', () => {
+	it('does not ask Acuity pylon availability for past current-month dates', () => {
+		expect(resolvePylonStartDate('2026-05', '2026-05-14')).toBe('2026-05-14');
+		expect(resolvePylonStartDate('2026-06', '2026-05-14')).toBe('2026-06-01');
+		expect(resolvePylonStartDate(undefined, '2026-05-14')).toBe('2026-05-14');
 	});
 
-	it('navigates to the requested target month before reading enabled dates', async () => {
-		const datesByMonth = new Map<string, string[]>([
-			['2026-07', ['2026-07-15']],
-			['2026-09', ['2026-09-12']],
+	it('parses calendar identity from category and non-category URLs', () => {
+		expect(
+			parsePylonCalendarIdentity(
+				'https://massageithaca.as.me/schedule/4671d709/category/X19hbGxfXw%3D%3D/appointment/53178494/calendar/8973181',
+			),
+		).toEqual({
+			origin: 'https://massageithaca.as.me',
+			owner: '4671d709',
+			appointmentTypeId: '53178494',
+			calendarId: '8973181',
+		});
+		expect(
+			parsePylonCalendarIdentity(
+				'https://massageithaca.as.me/schedule/4671d709/appointment/53178494/calendar/8973181',
+			),
+		).toMatchObject({
+			owner: '4671d709',
+			appointmentTypeId: '53178494',
+			calendarId: '8973181',
+		});
+	});
+
+	it('maps pylon times payloads to available dates and slot counts', () => {
+		expect(
+			toPylonAvailabilityDates({
+				'2026-05-17': [
+					{ time: '2026-05-17T09:00:00-0400', slotsAvailable: 1 },
+					{ time: '2026-05-17T09:30:00-0400', slotsAvailable: 2 },
+				],
+				'2026-05-18': [
+					{ time: '2026-05-18T09:00:00-0400', slotsAvailable: 0 },
+				],
+			}),
+		).toEqual([{ date: '2026-05-17', slots: 3 }]);
+	});
+
+	it('maps pylon times payloads to local slot datetimes', () => {
+		expect(
+			toPylonAvailabilitySlots(
+				{
+					'2026-05-17': [
+						{ time: '2026-05-17T09:00:00-0400', slotsAvailable: 1 },
+						{ time: '2026-05-17T09:30:00-0400', slotsAvailable: 0 },
+					],
+				},
+				'2026-05-17',
+			),
+		).toEqual([
+			{ datetime: '2026-05-17T09:00:00', available: true },
+			{ datetime: '2026-05-17T09:30:00', available: false },
 		]);
-		const fake = makeUrlDateReadPage('2026-07', datesByMonth);
+	});
+});
 
-		const dates = await runDateRead(fake.page, '2026-09');
+describe('readDatesViaUrl pylon API behavior', () => {
+	it('reads dates from Acuity pylon availability/times instead of react-calendar DOM', async () => {
+		const fake = makePylonReadPage({
+			'2026-05-17': [
+				{ time: '2026-05-17T09:00:00-0400', slotsAvailable: 1 },
+				{ time: '2026-05-17T09:30:00-0400', slotsAvailable: 1 },
+			],
+		});
 
-		expect(dates).toEqual([{ date: '2026-09-12', slots: 1 }]);
-		expect(fake.navClicks).toEqual(['next', 'next']);
+		const dates = await runDateRead(fake.page, '2026-05');
+
+		expect(dates).toEqual([{ date: '2026-05-17', slots: 2 }]);
 		expect(fake.gotoUrls[0]).toBe(
 			'https://massageithaca.as.me/?appointmentType=53178494',
 		);
+		const apiUrl = new URL(fake.apiUrls[0]);
+		expect(apiUrl.pathname).toBe('/api/scheduling/v1/availability/times');
+		expect(apiUrl.searchParams.get('owner')).toBe('4671d709');
+		expect(apiUrl.searchParams.get('appointmentTypeId')).toBe('53178494');
+		expect(apiUrl.searchParams.get('calendarId')).toBe('8973181');
+		expect(apiUrl.searchParams.get('startDate')).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+		expect(apiUrl.searchParams.get('maxDays')).toBe('45');
+	});
+
+	it('reads slots from the same Acuity pylon API', async () => {
+		const fake = makePylonReadPage({
+			'2026-05-17': [
+				{ time: '2026-05-17T09:00:00-0400', slotsAvailable: 1 },
+			],
+		});
+
+		const slots = await runSlotRead(fake.page, '2026-05-17');
+
+		expect(slots).toEqual([
+			{ datetime: '2026-05-17T09:00:00', available: true },
+		]);
+		const apiUrl = new URL(fake.apiUrls[0]);
+		expect(apiUrl.searchParams.get('startDate')).toBe('2026-05-17');
+		expect(apiUrl.searchParams.get('maxDays')).toBe('1');
 	});
 });

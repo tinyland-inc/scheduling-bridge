@@ -15,9 +15,6 @@ import { BrowserService } from '../../../shared/browser-service.js';
 import { ndjsonLog } from '../../../shared/logger.js';
 import { observePageOpEffect } from '../../../shared/metrics.js';
 import { WizardStepError } from '../errors.js';
-import { Selectors } from '../selectors.js';
-import { parseSlotText, buildIsoDatetime } from '../slot-parser.js';
-import { navigateToMonth, parseYearMonthKey } from '../wizard-calendar.js';
 import {
 	buildSlotReadProfileEvent,
 	createSlotReadProfile,
@@ -32,13 +29,27 @@ import {
 
 export interface UrlDateResult {
 	readonly date: string;  // YYYY-MM-DD
-	readonly slots: number; // 1 = available (exact count unknown without clicking)
+	readonly slots: number;
 }
 
 export interface UrlSlotResult {
-	readonly datetime: string; // time string like "4:00 PM"
+	readonly datetime: string; // local ISO datetime without offset
 	readonly available: boolean;
 }
+
+interface PylonCalendarIdentity {
+	readonly origin: string;
+	readonly owner: string;
+	readonly appointmentTypeId: string;
+	readonly calendarId: string;
+}
+
+interface PylonAvailabilitySlot {
+	readonly time?: string;
+	readonly slotsAvailable?: number;
+}
+
+type PylonAvailabilityTimes = Record<string, readonly PylonAvailabilitySlot[]>;
 
 const DEFAULT_URL_READ_NETWORK_IDLE_MS = 1500;
 const DEFAULT_EMPTY_DATE_SETTLE_MS = 2500;
@@ -77,26 +88,6 @@ const navigateForUrlRead = async (page: Page, url: URL, timeout: number): Promis
 	}
 };
 
-const postClickSlotSettleMs = (): number => {
-	const raw = Number(process.env.ACUITY_POST_CLICK_SLOT_SETTLE_MS);
-	return Number.isFinite(raw) && raw >= 0 ? raw : 900;
-};
-
-const waitForSlotUiAfterDateClick = async (
-	page: Page,
-	slotSelector: string,
-	timeout: number,
-): Promise<void> => {
-	const waitMs = Math.min(timeout, postClickSlotSettleMs());
-	if (waitMs <= 0) return;
-
-	await Promise.race([
-		page.waitForSelector(slotSelector, { timeout: waitMs }).then(() => undefined),
-		page.waitForLoadState('networkidle', { timeout: waitMs }).then(() => undefined).catch(() => undefined),
-		page.waitForTimeout(waitMs).then(() => undefined),
-	]).catch(() => undefined);
-};
-
 const navigateToServiceCalendar = (
 	page: Page,
 	url: URL,
@@ -108,81 +99,118 @@ const navigateToServiceCalendar = (
 		catch: (e) => new WizardStepError({ step, message: `Navigation failed: ${e}` }),
 	});
 
-const navigateToTargetMonth = (
-	page: Page,
-	targetMonth: string | undefined,
-	step: 'read-availability' | 'read-slots',
-): Effect.Effect<void, WizardStepError> => {
-	if (!targetMonth) return Effect.void;
-
-	const parsed = parseYearMonthKey(targetMonth);
-	if (!parsed) {
-		return Effect.fail(new WizardStepError({
-			step,
-			message: `Invalid target month: ${targetMonth}`,
-		}));
+export const parsePylonCalendarIdentity = (
+	rawUrl: string,
+): PylonCalendarIdentity | null => {
+	try {
+		const url = new URL(rawUrl);
+		const match = url.pathname.match(
+			/\/schedule\/([^/]+)(?:\/category\/[^/]+)?\/appointment\/(\d+)\/calendar\/(\d+)/,
+		);
+		if (!match) return null;
+		return {
+			origin: url.origin,
+			owner: decodeURIComponent(match[1]),
+			appointmentTypeId: match[2],
+			calendarId: match[3],
+		};
+	} catch {
+		return null;
 	}
-
-	return navigateToMonth(page, parsed.month, parsed.year, step);
 };
 
-const readEnabledCalendarDates = (
-	page: Page,
-	tileSelector: string,
-): Effect.Effect<UrlDateResult[], WizardStepError> =>
-	Effect.tryPromise({
-		try: () => page.evaluate((sel) => {
-			const results: Array<{ date: string; slots: number }> = [];
-			const neighboringClass = 'react-calendar__tile--neighboringMonth';
-			document.querySelectorAll(sel).forEach(tile => {
-				if ((tile as HTMLButtonElement).disabled) return;
-				if (tile.classList.contains(neighboringClass)) return;
-				if (tile.classList.contains('neighboringMonth')) return;
+export const resolvePylonStartDate = (
+	targetMonth?: string,
+	today = new Intl.DateTimeFormat('en-CA', {
+		timeZone: 'America/New_York',
+		year: 'numeric',
+		month: '2-digit',
+		day: '2-digit',
+	}).format(new Date()),
+): string => {
+	if (!targetMonth || !/^\d{4}-\d{2}$/.test(targetMonth)) {
+		return today;
+	}
+	const monthStart = `${targetMonth}-01`;
+	return monthStart < today ? today : monthStart;
+};
 
-				const abbr = tile.querySelector('abbr');
-				const label = abbr?.getAttribute('aria-label') || tile.getAttribute('data-date') || '';
-				if (label) {
-					const d = new Date(label);
-					if (!isNaN(d.getTime())) {
-						results.push({ date: d.toISOString().slice(0, 10), slots: 1 });
-					}
-				}
-			});
-			return results;
-		}, tileSelector),
-		catch: (e) => new WizardStepError({ step: 'read-availability', message: `Calendar read failed: ${e}` }),
-	});
+const normalizeAcuityDatetime = (value: string): string =>
+	value.replace(/([+-]\d{2}:?\d{2}|Z)$/u, '');
 
-const waitForEnabledCalendarDate = (
+export const toPylonAvailabilityDates = (
+	payload: PylonAvailabilityTimes,
+): UrlDateResult[] =>
+	Object.entries(payload)
+		.filter(([date, slots]) => (
+			/^\d{4}-\d{2}-\d{2}$/.test(date) &&
+			Array.isArray(slots) &&
+			slots.some((slot) => Number(slot.slotsAvailable ?? 1) > 0)
+		))
+		.map(([date, slots]) => ({
+			date,
+			slots: slots.reduce(
+				(total, slot) => total + Math.max(0, Number(slot.slotsAvailable ?? 1)),
+				0,
+			),
+		}))
+		.sort((a, b) => a.date.localeCompare(b.date));
+
+export const toPylonAvailabilitySlots = (
+	payload: PylonAvailabilityTimes,
+	date: string,
+): UrlSlotResult[] =>
+	(payload[date] ?? [])
+		.filter((slot) => typeof slot.time === 'string' && slot.time.length > 0)
+		.map((slot) => ({
+			datetime: normalizeAcuityDatetime(slot.time!),
+			available: Number(slot.slotsAvailable ?? 1) > 0,
+		}));
+
+const fetchPylonAvailabilityTimes = (
 	page: Page,
-	tileSelector: string,
-	timeout: number,
-): Effect.Effect<void, never> =>
+	serviceId: string,
+	startDate: string,
+	maxDays: number,
+	step: 'read-availability' | 'read-slots',
+): Effect.Effect<PylonAvailabilityTimes, WizardStepError> =>
 	Effect.tryPromise({
 		try: async () => {
-			const waitMs = dateEmptySettleTimeoutMs(timeout);
-			if (waitMs <= 0) return;
+			const identity = parsePylonCalendarIdentity(page.url());
+			if (!identity) {
+				throw new Error(`Could not parse Acuity calendar identity from ${page.url()}`);
+			}
+			if (identity.appointmentTypeId !== serviceId) {
+				throw new Error(
+					`Expected appointment type ${serviceId} but got ${identity.appointmentTypeId}`,
+				);
+			}
 
-			await page.waitForFunction((sel) => {
-				const neighboringClasses = [
-					'react-calendar__tile--neighboringMonth',
-					'neighboringMonth',
-				];
-				return Array.from(document.querySelectorAll(sel)).some(tile => {
-					const button = tile as HTMLButtonElement;
-					if (button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
-					if (neighboringClasses.some(className => tile.classList.contains(className))) return false;
+			const apiUrl = new URL('/api/scheduling/v1/availability/times', identity.origin);
+			apiUrl.searchParams.set('owner', identity.owner);
+			apiUrl.searchParams.set('appointmentTypeId', serviceId);
+			apiUrl.searchParams.set('calendarId', identity.calendarId);
+			apiUrl.searchParams.set('startDate', startDate);
+			apiUrl.searchParams.set('maxDays', String(maxDays));
+			apiUrl.searchParams.set('timezone', 'America/New_York');
 
-					const abbr = tile.querySelector('abbr');
-					const label = abbr?.getAttribute('aria-label') || tile.getAttribute('data-date') || '';
-					if (!label) return false;
-
-					return !Number.isNaN(new Date(label).getTime());
+			return page.evaluate(async (url) => {
+				const response = await fetch(url, {
+					headers: { accept: 'application/json' },
 				});
-			}, tileSelector, { timeout: waitMs }).catch(() => {});
+				if (!response.ok) {
+					throw new Error(`Acuity availability API returned ${response.status}`);
+				}
+				return await response.json() as PylonAvailabilityTimes;
+			}, apiUrl.toString());
 		},
-		catch: () => undefined,
-	}).pipe(Effect.ignore);
+		catch: (e) =>
+			new WizardStepError({
+				step,
+				message: `Acuity availability API read failed: ${e instanceof Error ? e.message : String(e)}`,
+				cause: e,
+			}),
+	});
 
 // =============================================================================
 // READ DATES VIA URL PARAM
@@ -209,27 +237,19 @@ export const readDatesViaUrl = (
 		url.searchParams.set('appointmentType', serviceId);
 
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-availability');
-		yield* navigateToTargetMonth(page, targetMonth, 'read-availability');
+		const startDate = resolvePylonStartDate(targetMonth);
+		const payload = yield* fetchPylonAvailabilityTimes(
+			page,
+			serviceId,
+			startDate,
+			45,
+			'read-availability',
+		);
 
-		// Wait for calendar tiles using the Selectors registry
-		const calendarSelector = Selectors.calendarDay.join(', ');
-		yield* Effect.tryPromise({
-			try: () => page.waitForSelector(calendarSelector, { timeout: 10000 }),
-			catch: () => null,
-		}).pipe(Effect.ignore);
-
-		const tileSelector = Selectors.calendarDay[0]; // .react-calendar__tile
-		let dates = yield* readEnabledCalendarDates(page, tileSelector);
-		if (dates.length > 0) {
-			return dates;
-		}
-
-		// Acuity occasionally paints the calendar shell before enabled dates are attached.
-		// Wait briefly for enabled tiles on the same page, but do not re-run a full
-		// deep-month navigation when the target month is legitimately empty.
-		yield* waitForEnabledCalendarDate(page, tileSelector, config.timeout);
-
-		return yield* readEnabledCalendarDates(page, tileSelector);
+		const dates = toPylonAvailabilityDates(payload);
+		return targetMonth
+			? dates.filter((date) => date.date.startsWith(`${targetMonth}-`))
+			: dates;
 	}));
 
 // =============================================================================
@@ -239,7 +259,7 @@ export const readDatesViaUrl = (
 /**
  * Read time slots by navigating directly to a service's calendar
  * via ?appointmentType={id}&date={YYYY-MM-DD} URL parameters,
- * then clicking the target date tile.
+ * then reading Acuity's pylon availability API from that browser session.
  *
  * @param serviceId - Acuity numeric appointment type ID
  * @param date - Target date in YYYY-MM-DD format
@@ -257,147 +277,44 @@ export const readSlotsViaUrl = (
 		);
 
 		let navigationMs = 0;
-		let calendarReadyMs = 0;
-		let dateSelectMs = 0;
-		let postClickSettleMs = 0;
-		let slotWaitMs = 0;
+		const calendarReadyMs = 0;
+		const dateSelectMs = 0;
+		const postClickSettleMs = 0;
+		const slotWaitMs = 0;
 		let slotDomReadMs = 0;
-		let parseMs = 0;
+		const parseMs = 0;
 		let calendarTileCount = 0;
 		let matchedDateFound = false;
 
 		const url = new URL(config.baseUrl);
 		url.searchParams.set('appointmentType', serviceId);
 		url.searchParams.set('date', date);
-		const targetMonth = date.slice(0, 7);
-		const slotSelector = Selectors.timeSlot[0]; // button.time-selection
-		const fallbackSelector = Selectors.timeSlot.join(', ');
 
 		const navigationStartedAt = Date.now();
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-slots');
-		yield* navigateToTargetMonth(page, targetMonth, 'read-slots');
 		navigationMs = Date.now() - navigationStartedAt;
 
-		// Click the target date on the calendar. Disabled dates are a valid
-		// "no availability" result, not a scrape failure.
-		const tileSelector = Selectors.calendarDay[0];
-		const clickedTargetDate = yield* Effect.tryPromise({
-			try: async () => {
-				const calendarReadyStartedAt = Date.now();
-				await page.waitForSelector(tileSelector, { timeout: 10000 }).catch(() => {});
-				calendarReadyMs = Date.now() - calendarReadyStartedAt;
-
-				const dateSelectStartedAt = Date.now();
-				const tiles = await page.$$(tileSelector);
-				calendarTileCount = tiles.length;
-				for (const tile of tiles) {
-					const abbr = await tile.$('abbr');
-					const label = await abbr?.getAttribute('aria-label');
-					if (label) {
-						const d = new Date(label);
-						if (d.toISOString().slice(0, 10) === date) {
-							matchedDateFound = true;
-							const disabled = await tile.evaluate((el) => {
-								const button = el as HTMLButtonElement;
-								return (
-									button.disabled ||
-									button.getAttribute('aria-disabled') === 'true' ||
-									button.classList.contains('react-calendar__tile--disabled')
-								);
-							});
-							if (disabled) {
-								dateSelectMs = Date.now() - dateSelectStartedAt;
-								return false;
-							}
-								await tile.click({ timeout: Math.min(config.timeout, 5000) });
-								dateSelectMs = Date.now() - dateSelectStartedAt;
-
-								const settleStartedAt = Date.now();
-								await waitForSlotUiAfterDateClick(page, fallbackSelector, config.timeout);
-								postClickSettleMs = Date.now() - settleStartedAt;
-								return true;
-							}
-					}
-				}
-				dateSelectMs = Date.now() - dateSelectStartedAt;
-				return false;
-			},
-			catch: (e) => new WizardStepError({ step: 'read-slots', message: `Date click failed: ${e}` }),
-		});
-
-		if (!clickedTargetDate) {
-			const profile = createSlotReadProfile({
-				serviceId,
-				date,
-				thresholdMs: profileConfig.thresholdMs,
-				calendarTileCount,
-				matchedDateFound,
-				slotCount: 0,
-				parsedSlotCount: 0,
-				phases: {
-					navigationMs,
-					calendarReadyMs,
-					dateSelectMs,
-					postClickSettleMs,
-					slotWaitMs,
-					slotDomReadMs,
-					parseMs,
-				},
-				context,
-			});
-
-			if (shouldLogSlotReadProfile(profile, profileConfig)) {
-				ndjsonLog('INFO', 'Slot read profile', { ...buildSlotReadProfileEvent(profile) });
-			}
-
-			return [];
-		}
-
-			// Read time slots using the Selectors registry
-			const slotWaitStartedAt = Date.now();
-		yield* Effect.tryPromise({
-			try: () => page.waitForSelector(fallbackSelector, { timeout: 10000 }),
-			catch: () => null,
-		}).pipe(Effect.ignore);
-		slotWaitMs = Date.now() - slotWaitStartedAt;
-
 		const slotDomReadStartedAt = Date.now();
-		const slots = yield* Effect.tryPromise({
-			try: () => page.evaluate((sel) => {
-				const results: Array<{ datetime: string; available: boolean }> = [];
-				document.querySelectorAll(sel).forEach(btn => {
-					const raw = btn.textContent?.trim() || '';
-					const disabled = btn.hasAttribute('disabled');
-					if (raw) {
-						results.push({ datetime: raw, available: !disabled });
-					}
-				});
-				return results;
-			}, slotSelector),
-			catch: (e) => new WizardStepError({ step: 'read-slots', message: `Slots read failed: ${e}` }),
-		});
+		const payload = yield* fetchPylonAvailabilityTimes(
+			page,
+			serviceId,
+			date,
+			1,
+			'read-slots',
+		);
+		const parsedSlots = toPylonAvailabilitySlots(payload, date);
 		slotDomReadMs = Date.now() - slotDomReadStartedAt;
+		calendarTileCount = Object.keys(payload).length;
+		matchedDateFound = Object.prototype.hasOwnProperty.call(payload, date);
 
-		// Parse slot text and build full ISO datetime (e.g., "4:00 PM" → "2026-04-01T16:00:00")
-		const parseStartedAt = Date.now();
-		let parsedSlotCount = 0;
-		const parsedSlots = slots.map(s => {
-			const parsed = parseSlotText(s.datetime);
-			if (parsed) parsedSlotCount += 1;
-			return {
-				datetime: parsed ? buildIsoDatetime(date, parsed.time) : s.datetime,
-				available: s.available,
-			};
-		});
-		parseMs = Date.now() - parseStartedAt;
 		const profile = createSlotReadProfile({
 			serviceId,
 			date,
 			thresholdMs: profileConfig.thresholdMs,
 			calendarTileCount,
 			matchedDateFound,
-			slotCount: slots.length,
-			parsedSlotCount,
+			slotCount: parsedSlots.length,
+			parsedSlotCount: parsedSlots.length,
 			phases: {
 				navigationMs,
 				calendarReadyMs,

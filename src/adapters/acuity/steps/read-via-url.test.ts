@@ -8,7 +8,10 @@ import {
 } from '../../../shared/browser-service.js';
 import {
 	dateEmptySettleTimeoutMs,
+	parseTimeSelectionDates,
+	parseTimeSelectionSlots,
 	readDatesViaUrl,
+	type TimeSelectionEntry,
 	urlReadNetworkIdleTimeoutMs,
 } from './read-via-url.js';
 
@@ -158,6 +161,58 @@ const runDateRead = (page: Page, targetMonth?: string) =>
 	);
 
 describe('readDatesViaUrl DOM behavior', () => {
+	it('derives available dates from the current Acuity time-selection list', () => {
+		const entries: TimeSelectionEntry[] = [
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday May 31',
+				disabled: false,
+			},
+			{
+				text: '10:30 AM1 spot left',
+				ariaLabel: '10:30 AM, 1 spot left, Sunday May 31',
+				disabled: false,
+			},
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday Jun 7',
+				disabled: false,
+			},
+		];
+
+		expect(parseTimeSelectionDates(entries, '2026-05')).toEqual([
+			{ date: '2026-05-31', slots: 1 },
+		]);
+		expect(parseTimeSelectionDates(entries, '2026-06')).toEqual([
+			{ date: '2026-06-07', slots: 1 },
+		]);
+	});
+
+	it('filters direct time-selection slots to the requested date', () => {
+		const entries: TimeSelectionEntry[] = [
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday May 31',
+				disabled: false,
+			},
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday Jun 7',
+				disabled: false,
+			},
+			{
+				text: '10:30 AM1 spot left',
+				ariaLabel: '10:30 AM, 1 spot left, Sunday Jun 7',
+				disabled: true,
+			},
+		];
+
+		expect(parseTimeSelectionSlots(entries, '2026-06-07')).toEqual([
+			{ datetime: '10:00 AM1 spot left', available: true },
+			{ datetime: '10:30 AM1 spot left', available: false },
+		]);
+	});
+
 	it('waits for enabled dates before returning an empty month', async () => {
 		const datesByMonth = new Map<string, string[]>([['2026-07', []]]);
 		const fake = makeUrlDateReadPage('2026-07', datesByMonth, () => {
@@ -167,7 +222,7 @@ describe('readDatesViaUrl DOM behavior', () => {
 		const dates = await runDateRead(fake.page);
 
 		expect(dates).toEqual([{ date: '2026-07-15', slots: 1 }]);
-		expect(fake.page.evaluate).toHaveBeenCalledTimes(2);
+		expect(fake.page.evaluate).toHaveBeenCalledTimes(3);
 		expect(fake.page.waitForFunction).toHaveBeenCalledTimes(1);
 	});
 

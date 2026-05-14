@@ -40,8 +40,44 @@ export interface UrlSlotResult {
 	readonly available: boolean;
 }
 
+export interface TimeSelectionEntry {
+	readonly text: string;
+	readonly ariaLabel: string;
+	readonly disabled: boolean;
+}
+
 const DEFAULT_URL_READ_NETWORK_IDLE_MS = 1500;
 const DEFAULT_EMPTY_DATE_SETTLE_MS = 2500;
+const DEFAULT_MORE_TIMES_CLICKS = 8;
+
+const MONTH_INDEX_BY_NAME = new Map<string, number>(
+	[
+		['jan', 0],
+		['january', 0],
+		['feb', 1],
+		['february', 1],
+		['mar', 2],
+		['march', 2],
+		['apr', 3],
+		['april', 3],
+		['may', 4],
+		['jun', 5],
+		['june', 5],
+		['jul', 6],
+		['july', 6],
+		['aug', 7],
+		['august', 7],
+		['sep', 8],
+		['sept', 8],
+		['september', 8],
+		['oct', 9],
+		['october', 9],
+		['nov', 10],
+		['november', 10],
+		['dec', 11],
+		['december', 11],
+	] as const,
+);
 
 export const urlReadNetworkIdleTimeoutMs = (
 	timeout: number,
@@ -95,6 +131,167 @@ const waitForSlotUiAfterDateClick = async (
 		page.waitForLoadState('networkidle', { timeout: waitMs }).then(() => undefined).catch(() => undefined),
 		page.waitForTimeout(waitMs).then(() => undefined),
 	]).catch(() => undefined);
+};
+
+const moreTimesClickLimit = (
+	env: Record<string, string | undefined> = process.env,
+): number => {
+	const parsed = Number(env.ACUITY_MORE_TIMES_CLICK_LIMIT);
+	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MORE_TIMES_CLICKS;
+	return Math.floor(parsed);
+};
+
+const waitForMoreTimesSettle = async (page: Page, timeout: number): Promise<void> => {
+	const waitMs = Math.min(timeout, postClickSlotSettleMs());
+	if (waitMs <= 0) return;
+	await page.waitForTimeout(waitMs).catch(() => undefined);
+};
+
+const inferYearForMonth = (
+	monthIndex: number,
+	targetMonth?: string,
+	now = new Date(),
+): number => {
+	const parsedTarget = targetMonth?.match(/^(\d{4})-(\d{2})$/);
+	if (parsedTarget) {
+		const targetYear = Number(parsedTarget[1]);
+		const targetMonthIndex = Number(parsedTarget[2]) - 1;
+		const delta = monthIndex - targetMonthIndex;
+		if (delta > 6) return targetYear - 1;
+		if (delta < -6) return targetYear + 1;
+		return targetYear;
+	}
+
+	const currentMonth = now.getMonth();
+	const currentYear = now.getFullYear();
+	return currentMonth - monthIndex > 6 ? currentYear + 1 : currentYear;
+};
+
+const parseTimeSelectionDate = (
+	label: string,
+	targetMonth?: string,
+): string | null => {
+	const match = label.match(
+		/\b(?:Sun(?:day)?|Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?)?\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+([0-3]?\d)(?:,?\s+(\d{4}))?\b/i,
+	);
+	if (!match) return null;
+
+	const monthIndex = MONTH_INDEX_BY_NAME.get(match[1].toLowerCase());
+	if (monthIndex === undefined) return null;
+
+	const day = Number(match[2]);
+	if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+
+	const year = match[3] ? Number(match[3]) : inferYearForMonth(monthIndex, targetMonth);
+	if (!Number.isInteger(year) || year < 2000) return null;
+
+	return `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
+
+export const parseTimeSelectionDates = (
+	entries: readonly TimeSelectionEntry[],
+	targetMonth?: string,
+): UrlDateResult[] => {
+	const seen = new Set<string>();
+	const results: UrlDateResult[] = [];
+
+	for (const entry of entries) {
+		if (entry.disabled) continue;
+		const date = parseTimeSelectionDate(entry.ariaLabel || entry.text, targetMonth);
+		if (!date) continue;
+		if (targetMonth && !date.startsWith(`${targetMonth}-`)) continue;
+		if (seen.has(date)) continue;
+		seen.add(date);
+		results.push({ date, slots: 1 });
+	}
+
+	return results.sort((a, b) => a.date.localeCompare(b.date));
+};
+
+export const parseTimeSelectionSlots = (
+	entries: readonly TimeSelectionEntry[],
+	date: string,
+): UrlSlotResult[] =>
+	entries
+		.filter((entry) => parseTimeSelectionDate(entry.ariaLabel || entry.text, date.slice(0, 7)) === date)
+		.map((entry) => ({
+			datetime: entry.text || entry.ariaLabel,
+			available: !entry.disabled,
+		}));
+
+const collectTimeSelectionEntries = async (
+	page: Page,
+	selector: string,
+): Promise<TimeSelectionEntry[]> =>
+	page.evaluate((sel) => {
+		return Array.from(document.querySelectorAll(sel)).map((node) => {
+			const element = node as HTMLButtonElement;
+			return {
+				text: element.textContent?.trim() ?? '',
+				ariaLabel: element.getAttribute('aria-label') ?? '',
+				disabled:
+					element.disabled ||
+					element.hasAttribute('disabled') ||
+					element.getAttribute('aria-disabled') === 'true',
+			};
+		});
+	}, selector);
+
+const clickMoreTimes = async (page: Page): Promise<boolean> =>
+	page.evaluate(() => {
+		const buttons = Array.from(document.querySelectorAll('button'));
+		const button = buttons.find((candidate) => {
+			const label = candidate.getAttribute('aria-label')?.trim().toLowerCase() ?? '';
+			const text = candidate.textContent?.trim().toLowerCase() ?? '';
+			return label === 'more times' || text === 'more times';
+		}) as HTMLButtonElement | undefined;
+		if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') {
+			return false;
+		}
+		button.click();
+		return true;
+	});
+
+const readDirectTimeSelectionDates = async (
+	page: Page,
+	selector: string,
+	targetMonth: string | undefined,
+	timeout: number,
+): Promise<UrlDateResult[]> => {
+	let entries = await collectTimeSelectionEntries(page, selector);
+	let dates = parseTimeSelectionDates(entries, targetMonth);
+	const clickLimit = targetMonth ? moreTimesClickLimit() : 0;
+
+	for (let i = 0; dates.length === 0 && i < clickLimit; i += 1) {
+		const clicked = await clickMoreTimes(page);
+		if (!clicked) break;
+		await waitForMoreTimesSettle(page, timeout);
+		entries = await collectTimeSelectionEntries(page, selector);
+		dates = parseTimeSelectionDates(entries, targetMonth);
+	}
+
+	return dates;
+};
+
+const readDirectTimeSelectionSlots = async (
+	page: Page,
+	selector: string,
+	date: string,
+	timeout: number,
+): Promise<UrlSlotResult[]> => {
+	let entries = await collectTimeSelectionEntries(page, selector);
+	let slots = parseTimeSelectionSlots(entries, date);
+	const clickLimit = moreTimesClickLimit();
+
+	for (let i = 0; slots.length === 0 && i < clickLimit; i += 1) {
+		const clicked = await clickMoreTimes(page);
+		if (!clicked) break;
+		await waitForMoreTimesSettle(page, timeout);
+		entries = await collectTimeSelectionEntries(page, selector);
+		slots = parseTimeSelectionSlots(entries, date);
+	}
+
+	return slots;
 };
 
 const navigateToServiceCalendar = (
@@ -211,10 +408,13 @@ export const readDatesViaUrl = (
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-availability');
 		yield* navigateToTargetMonth(page, targetMonth, 'read-availability');
 
-		// Wait for calendar tiles using the Selectors registry
-		const calendarSelector = Selectors.calendarDay.join(', ');
+		// Wait for either the legacy react-calendar grid or the current direct
+		// time-list view. Acuity may skip the grid when the service URL resolves
+		// directly to upcoming times.
+		const directTimeSelector = Selectors.timeSlot[0];
+		const availabilitySelector = `${Selectors.calendarDay.join(', ')}, ${Selectors.timeSlot.join(', ')}`;
 		yield* Effect.tryPromise({
-			try: () => page.waitForSelector(calendarSelector, { timeout: 10000 }),
+			try: () => page.waitForSelector(availabilitySelector, { timeout: 10000 }),
 			catch: () => null,
 		}).pipe(Effect.ignore);
 
@@ -224,12 +424,28 @@ export const readDatesViaUrl = (
 			return dates;
 		}
 
+		dates = yield* Effect.tryPromise({
+			try: () => readDirectTimeSelectionDates(page, directTimeSelector, targetMonth, config.timeout),
+			catch: (e) => new WizardStepError({ step: 'read-availability', message: `Direct time-list date read failed: ${e}` }),
+		});
+		if (dates.length > 0) {
+			return dates;
+		}
+
 		// Acuity occasionally paints the calendar shell before enabled dates are attached.
 		// Wait briefly for enabled tiles on the same page, but do not re-run a full
 		// deep-month navigation when the target month is legitimately empty.
 		yield* waitForEnabledCalendarDate(page, tileSelector, config.timeout);
 
-		return yield* readEnabledCalendarDates(page, tileSelector);
+		dates = yield* readEnabledCalendarDates(page, tileSelector);
+		if (dates.length > 0) {
+			return dates;
+		}
+
+		return yield* Effect.tryPromise({
+			try: () => readDirectTimeSelectionDates(page, directTimeSelector, targetMonth, config.timeout),
+			catch: (e) => new WizardStepError({ step: 'read-availability', message: `Direct time-list date read failed: ${e}` }),
+		});
 	}));
 
 // =============================================================================
@@ -326,6 +542,51 @@ export const readSlotsViaUrl = (
 		});
 
 		if (!clickedTargetDate) {
+			const directSlotReadStartedAt = Date.now();
+			const directSlots = yield* Effect.tryPromise({
+				try: () => readDirectTimeSelectionSlots(page, fallbackSelector, date, config.timeout),
+				catch: (e) => new WizardStepError({ step: 'read-slots', message: `Direct time-list slots read failed: ${e}` }),
+			});
+			slotDomReadMs = Date.now() - directSlotReadStartedAt;
+			if (directSlots.length > 0) {
+				const parseStartedAt = Date.now();
+				let parsedSlotCount = 0;
+				const parsedSlots = directSlots.map(s => {
+					const parsed = parseSlotText(s.datetime);
+					if (parsed) parsedSlotCount += 1;
+					return {
+						datetime: parsed ? buildIsoDatetime(date, parsed.time) : s.datetime,
+						available: s.available,
+					};
+				});
+				parseMs = Date.now() - parseStartedAt;
+				const profile = createSlotReadProfile({
+					serviceId,
+					date,
+					thresholdMs: profileConfig.thresholdMs,
+					calendarTileCount,
+					matchedDateFound: true,
+					slotCount: directSlots.length,
+					parsedSlotCount,
+					phases: {
+						navigationMs,
+						calendarReadyMs,
+						dateSelectMs,
+						postClickSettleMs,
+						slotWaitMs,
+						slotDomReadMs,
+						parseMs,
+					},
+					context,
+				});
+
+				if (shouldLogSlotReadProfile(profile, profileConfig)) {
+					ndjsonLog('INFO', 'Slot read profile', { ...buildSlotReadProfileEvent(profile) });
+				}
+
+				return parsedSlots;
+			}
+
 			const profile = createSlotReadProfile({
 				serviceId,
 				date,

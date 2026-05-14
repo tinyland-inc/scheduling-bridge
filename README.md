@@ -104,7 +104,7 @@ before reporting it as work; non-retryable terminal jobs are reported under
 
 ### Queue Hygiene
 
-Bridge `0.5.11` supports bounded worker drain concurrency through
+Bridge `0.5.12` supports bounded worker drain concurrency through
 `BRIDGE_WORKER_CONCURRENCY`. The package default remains `1`; the MassageIthaca
 K8s deployment currently opts into `2` through Blahaj/OpenTofu after proving the
 datepicker readiness gate remains green.

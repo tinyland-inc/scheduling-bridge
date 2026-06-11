@@ -106,7 +106,7 @@ flowchart TB
   FB -->|builds| FL[Flow - steps + plan]
 
   subgraph runtime [Bridge runtime]
-    RF[runFlow fold<br/>per segment: one Scope region<br/>per node: decode needs / retry / observe landing / merge provides]
+    RF[runFlow fold<br/>per segment: one Scope region<br/>per node: decode needs / retry / observe landing / merge provides<br/>budgeted backward recovery edges on Recoverable]
     FL --> RF
     VP[VendorFlowPack Layer<br/>selectors + station detector + matchers] --> RF
     RF -->|append-only rows| FJ[(FlowJournal<br/>memory / Redis list / Postgres table)]
@@ -135,11 +135,23 @@ All new code in bridge `src/flow/`. `Schema` is `effect/Schema`; zero new runtim
 // src/flow/state.ts
 import { Context, Effect, Schedule, Schema } from 'effect';
 
-/** Durable flow state: Schema-codable values ONLY. Volatile handles (Page, ElementHandle)
- * live in R (Context services), never in state. Structural: a Schema cannot encode a handle. */
+/** Durable flow state: plain-data, JSON-encodable schemas ONLY. Volatile handles (Page,
+ * ElementHandle) live in R (Context services), never in state. This is a convention with
+ * layered enforcement, NOT a structural impossibility — `Schema.declare`/`Schema.Any` can wrap
+ * arbitrary runtime values (an ElementHandle included). Fences: (a) `JsonEncodableSpec` rejects
+ * schemas whose Encoded side is not `JsonValue`; (b) the §11 state-schema conformance test;
+ * (c) an ESLint ban on `Schema.declare`/`Schema.Any` in flow-state positions (catches the
+ * `any`-typed escapes that slip past (a)). */
+export type JsonValue =
+  | string | number | boolean | null
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
 export interface FlowStateSpec {
   readonly [key: string]: Schema.Schema<any, any, never>;
 }
+export type JsonEncodableSpec<Spec extends FlowStateSpec> = {
+  readonly [K in keyof Spec]: Schema.Schema.Encoded<Spec[K]> extends JsonValue ? Spec[K] : never;
+};
 export type StateOf<Spec extends FlowStateSpec> = {
   readonly [K in keyof Spec]: Schema.Schema.Type<Spec[K]>;
 };
@@ -161,7 +173,8 @@ export interface LandingObservation {
 }
 export type LandingOutcome =
   | { readonly _tag: 'OnTrack'; readonly landing: StationId }
-  | { readonly _tag: 'Recoverable'; readonly landing: StationId; readonly rerouteTo: string }
+  | { readonly _tag: 'Recoverable'; readonly landing: StationId;
+      readonly rerouteTo: string }           // must name a declared RecoveryEdge.to (§4 plan.ts)
   | { readonly _tag: 'Diverged'; readonly observation: LandingObservation };
 
 // src/flow/fuzzy.ts — fuzzy-in: tolerant matching with confidence. Pure scorers reused
@@ -234,12 +247,16 @@ export interface FlowStep<
 }
 
 // src/flow/plan.ts — the serializable projection (derived, never authored)
+export interface RecoveryEdge {
+  readonly to: string;                       // target stepId; MAY point backward (re-entry)
+  readonly maxReentries: number;             // journaled re-entry budget; default 1
+}
 export interface FlowPlanNode {
   readonly stepId: string;
   readonly needs: readonly string[];
   readonly provides: readonly string[];
-  readonly dependsOn: readonly string[];     // derived: nodes providing my needs
-  readonly branches?: readonly string[];     // declared reroute targets
+  readonly dependsOn: readonly string[];     // forward edges (nodes providing my needs): acyclic
+  readonly recoveries?: readonly RecoveryEdge[]; // recovery edges: may point backward, budgeted
   readonly expects: readonly StationId[];
   readonly idempotency: IdempotencyClass;
   readonly segment: string;
@@ -249,7 +266,7 @@ export interface FlowPlan {
   readonly flowId: string;                   // 'booking_create_with_payment', ...
   readonly backend: BridgeBackend;
   readonly version: string;                  // semver of the flow shape
-  readonly nodes: readonly FlowPlanNode[];   // topologically ordered
+  readonly nodes: readonly FlowPlanNode[];   // topologically ordered by forward edges
 }
 // planHash = sha256(canonical JSON of FlowPlan); pinned into the job record at enqueue
 // (additive fields planHash?, flowVersion? on BridgeJobRecord).
@@ -260,15 +277,20 @@ export interface Flow<Spec extends FlowStateSpec, E, R> {
   readonly planHash: string;
   readonly steps: ReadonlyMap<string, FlowStep<Spec, any, any, E, R>>;
 }
-export declare const makeFlow: <Spec extends FlowStateSpec>(spec: Spec) =>
+export declare const makeFlow: <Spec extends FlowStateSpec>(spec: Spec & JsonEncodableSpec<Spec>) =>
   FlowBuilder<Spec, never /* Provided */, never /* E */, never /* R */>;
 // FlowBuilder.add(step) compiles ONLY if step.meta.needs ⊆ Provided ∪ keyof Initial; the same
-// constraint, acyclicity, and segment-contiguity are re-validated at runtime at construction.
-// .branch(on: (state, observed) => stepId, targets) records `branches` in the plan node.
+// constraint, forward-edge acyclicity, and segment-contiguity are re-validated at runtime at
+// construction. Forward edges (dependsOn) are the structural DAG of progress and MUST be
+// acyclic. .recover(on: (state, observed) => stepId, edges) records `recoveries`: explicitly
+// marked recovery edges that MAY point backward, each with a journaled re-entry budget
+// (maxReentries, default 1); excluded from the acyclicity check, so the plan stays a DAG with
+// annotated recovery edges and the executed trace is a finite unrolling, bounded in §5.
 // There is NO JSON/IR authoring path; plans are output, never input.
 
 // src/flow/journal.ts — append-only checkpoint rows, separate keyspace
-export type CheckpointStatus = 'started' | 'completed' | 'failed' | 'compensated' | 'skipped_resume';
+export type CheckpointStatus =
+  'started' | 'completed' | 'failed' | 'compensated' | 'skipped_resume' | 'rerouted';
 export interface FlowCheckpoint {
   readonly operationId: string;              // = BridgeJobRecord.operationId
   readonly seq: number;                      // monotonic per operation
@@ -284,6 +306,7 @@ export interface FlowCheckpoint {
   readonly stateDelta?: Record<string, unknown>; // Schema-encoded Provides; segment
                                                  // boundaries only; redaction-annotated
   readonly idempotencyToken?: string;
+  readonly reroute?: { readonly to: string; readonly remaining: number }; // on 'rerouted' rows
   readonly error?: { readonly code: string; readonly message: string; readonly retryable: boolean };
 }
 export class FlowJournal extends Context.Tag('scheduling-bridge/FlowJournal')<
@@ -304,11 +327,14 @@ export interface FlowOutcome<O> {
 
 Storage layout (eliminates the embedded-array clobber hazard: the Redis store round-trips whole
 `BridgeJobRecord` JSON, so an embedded journal array would be read-modify-write under
-lease-expiry races): memory — per-operation array; Redis —
-`RPUSH bridge:flow:journal:{operationId}` + `INCR` seq counter, TTL coupled to a retention knob
-rather than job-record TTL; Postgres — additive `flow_checkpoints` table with
-`PRIMARY KEY (operation_id, seq)`. `BridgeJobRecord` gains only scalar additive fields
-(`planHash?`, `flowVersion?`); the journal is never embedded in the record.
+lease-expiry races): memory — per-operation array, trivially serial; Redis — one atomic Lua
+script per append that derives `seq = LLEN bridge:flow:journal:{operationId}` and `RPUSH`es the
+seq-stamped row in the same atomic step (a separate `INCR` seq counter would let two workers
+interleave under exactly the lease-expiry race above — list order diverging from seq, duplicate
+attempt rows), with TTL coupled to a retention knob rather than job-record TTL; Postgres —
+additive `flow_checkpoints` table whose `PRIMARY KEY (operation_id, seq)` gives the same
+guarantee declaratively. `BridgeJobRecord` gains only scalar additive fields (`planHash?`,
+`flowVersion?`); the journal is never embedded in the record.
 
 ## 5. Execution semantics
 
@@ -330,8 +356,14 @@ matched 0.95 normalized-exact, slots snapshot stale"). No write-class node runs 
 2. Per node: decode `needs` from accumulated state; journal `started` (with `idempotencyToken`
    when the step mints one); run with `Effect.retry(meta.retry ?? Schedule.stop)`; compare
    `observed` vs `expects` → `LandingOutcome`; journal `completed`/`failed`; merge `provides`.
-3. `Recoverable` reroutes to a node listed in `branches` (targets are data; choosers are typed
-   code). `Diverged` fails with the observation attached. `confidenceFloor` accumulates.
+3. `Recoverable` reroutes along a declared recovery edge (targets are data; choosers are typed
+   code). Recovery edges may point backward — the motivating case: navigate expects
+   `acuity:client-form`, lands on `acuity:service-selection`, recovery re-enters
+   `acuity/navigate`. Each traversal journals a `rerouted` row (edge + remaining budget) and
+   decrements that edge's `maxReentries`; exhaustion escalates to `Diverged`. The fold
+   terminates: total step executions ≤ |nodes| × (1 + Σ `maxReentries` over recovery edges);
+   the executed trace is a finite unrolling of the forward-acyclic plan. `Diverged` fails with
+   the observation attached; `confidenceFloor` accumulates.
 
 **Checkpoint persistence discipline** (evidence before control state):
 
@@ -383,8 +415,10 @@ appointment delete when `adminApiConfigured`); the bridge never refunds. Compens
 as `compensated` and unwind in reverse order of success.
 
 **PII hygiene.** Journaled `stateDelta` uses Schema redaction annotations on encode (client
-names/emails/intake answers); a TTL purge job bounds retention; volatile outputs structurally
-cannot appear in a `FlowStateSpec`.
+names/emails/intake answers); a TTL purge job bounds retention; volatile outputs are kept out
+of `FlowStateSpec` by enforced convention — the `JsonEncodableSpec` registration guard, the
+state-schema conformance test, and the `Schema.declare`/`Schema.Any` lint ban (§4) — not by
+structural impossibility.
 
 ## 6. Fuzzy-in / fuzzy-out contracts
 
@@ -412,6 +446,13 @@ selector-drift dashboards (`StepMeta.selectorKeys` × `selector-health.ts`). The
 fuzzy-out is `FlowOutcome.landed`: intended terminal, alternate terminal, or compensated — plus
 `confidenceFloor` as a single triage scalar for ops and reconciliation.
 
+The primary fuzzy-out recovery is a *backward* move: navigate expects `acuity:client-form`,
+lands on `acuity:service-selection`, and `Recoverable` reroutes along a declared recovery edge
+back to `acuity/navigate` — not a forward skip. Recovery edges are first-class plan data (§4)
+with journaled re-entry budgets; the fold honors them under a stated termination bound (§5),
+and budget exhaustion escalates to `Diverged` rather than looping — or hard-failing the very
+case the design exists to recover.
+
 Existing fuzzy-out surfaces map directly: bypass's `$0` verification becomes
 `acuity/verify-zero-total`'s landing observation; submit's 4-signal race becomes the
 `acuity:confirmation` detector; `PAYMENT_BYPASS_NOT_PROVEN` (`server/worker.ts:151-167`) becomes
@@ -431,24 +472,27 @@ export class VendorFlowPack extends Context.Tag('scheduling-bridge/VendorFlowPac
   VendorFlowPack, {
     readonly backend: BridgeBackend;
     readonly stations: readonly StationId[];
-    readonly detectStation: Effect.Effect<LandingObservation, never>;
+    readonly detectStation: (page: Page) => Effect.Effect<LandingObservation, never, never>;
     readonly selectors: SelectorRegistry;     // per-tenant entries come from selectorProfile data
-    readonly matchers: { readonly service: ServiceMatcher.Service /* date, field */ };
+    readonly matchers: { readonly service: Context.Tag.Service<ServiceMatcher> /* date, field */ };
     readonly flows: { readonly [flowId: string]: Flow<any, MiddlewareError, any> };
     readonly paymentInjection: 'native' | 'coupon-bypass' | 'external-link';
   }
 >() {}
 ```
 
-- **Acuity** (0.6.0): existing steps wrap mechanically — they already read Context and return
-  landing data. `AcuityFlowPackLive` assembles `ServiceResolverLive`, the selector registry,
-  and `detectLandingStep`. Step bodies are untouched in 0.6.0.
-- **De-tenanting** rides the pack extraction: MassageIthaca-specific selector entries
-  (`field-13933959`, `field-16606770`, the Noha Acupuncture referral option) move into
+- **Acuity** (0.6.0 assembles, 0.7.0 extracts): existing steps wrap mechanically — they already
+  read Context and return landing data. 0.6.0 defines the `VendorFlowPack` interface + Context
+  tag (types only) and assembles `AcuityFlowPackLive` from the *existing un-extracted pieces*
+  (`ServiceResolverLive`, `selectors.ts` as it stands, `detectLandingStep` in place); step
+  bodies and module boundaries are untouched. 0.7.0 owns the physical extraction of
+  `SelectorRegistry` and the station detector into standalone modules behind the pack (§10).
+- **De-tenanting** (0.7.0, riding the physical extraction): MassageIthaca-specific selector
+  entries (`field-13933959`, `field-16606770`, the Noha Acupuncture referral option) move into
   selector-profile *data* keyed by `BridgeAdapterProfile.selectorProfile` (the field already
   exists, `async/types.ts:32`); test pins on `massageithaca.as.me` move to a fresh dev-account
   profile. A shared segment is only "vendor-neutral" after this; wrapping leakage as-is is
-  forbidden.
+  forbidden — which is why de-tenanting and the extraction land in the same release.
 - **CalCom** (0.7.0, read-only first): the same flow ids with REST-backed steps. Per-flow R
   typing makes this free — its steps demand `HttpClient`, not `BrowserService`; a REST flow
   never provisions a browser Layer (the union-R erasure failure mode of an IR interpreter is
@@ -538,7 +582,8 @@ deferred until reconciliation actually consumes it.
 - Execution through `runFlow` only when `BRIDGE_FLOW_RUNNER=1` (default off). **Shadow mode**:
   legacy path executes; the plan projection runs alongside and diffs predicted vs actual step
   sequence into `shared/metrics.ts` (plans only — no dual execution of effects).
-- Selector de-tenanting begins: MI entries move to selector-profile data.
+- `VendorFlowPack` interface + Context tag defined (types only); `AcuityFlowPackLive` assembled
+  from existing un-extracted pieces — no module moves, no de-tenanting yet (both 0.7.0, per §7).
 - Tests: existing suites pass unchanged; plan-shape snapshot tests; test hooks preserved as
   Layer shims.
 
@@ -559,9 +604,11 @@ deferred until reconciliation actually consumes it.
   `runFlow` is the only execution path. A conformance test asserts identical step traces
   pre/post. Plan metadata cannot become dead data that drifts beside the real path: the
   dual-path window is capped to one minor.
-- `VendorFlowPack` tag; `SelectorRegistry`/station detectors extracted; `payment/coupon-bypass`
-  segment + double capability gate; CalCom read-only pack against the fresh dev account;
-  `DateMatcher`/`FieldMatcher` machinery; fuzzy scorers graduate to kit (kit minor).
+- Physical extraction behind the 0.6.0-defined `VendorFlowPack` tag: `SelectorRegistry` and
+  station detectors become standalone modules; selector de-tenanting completes — MI entries
+  move to selector-profile data (per §7). `payment/coupon-bypass` segment + double capability
+  gate; CalCom read-only pack against the fresh dev account; `DateMatcher`/`FieldMatcher`
+  machinery; fuzzy scorers graduate to kit (kit minor).
 
 **0.8.0 — vendor #2 exam and surface freeze.**
 
@@ -573,8 +620,8 @@ deferred until reconciliation actually consumes it.
 
 | # | Risk | Mitigation |
 |---|---|---|
-| 1 | Journal write races / record bloat | Append-only rows in a separate keyspace from day one (never embedded in `BridgeJobRecord`); per-store conformance tests; retention TTL decoupled from job TTL |
-| 2 | Volatile handles journaled (e.g. `ServiceResolution.element` ElementHandle, `service-resolver.ts:26`) | Structural: `FlowStateSpec` admits only Schema-codable values; volatile data lives in R; lint + review as defense-in-depth |
+| 1 | Journal write races / record bloat | Append-only rows in a separate keyspace from day one (never embedded in `BridgeJobRecord`); seq assignment atomic with the append (Redis Lua script deriving seq from `LLEN`; Postgres `PRIMARY KEY (operation_id, seq)`; memory serial); per-store conformance tests; retention TTL decoupled from job TTL |
+| 2 | Volatile handles journaled (e.g. `ServiceResolution.element` ElementHandle, `service-resolver.ts:26`) | Enforced convention, not structural: `JsonEncodableSpec` registration guard; conformance test encoding every flow's state schema to JSON primitives; ESLint ban on `Schema.declare`/`Schema.Any` in flow-state positions; volatile data lives in R |
 | 3 | Resume double-booking | `effectful-once` gate: `started`-without-`completed` ⇒ `reconcile_required`; confirmation probe before any re-submit; never silent retry past submit |
 | 4 | Plan/behavior drift | Builder is the single front door (no JSON authoring; ESLint ban on raw `Effect.gen` wizard composition in adapters); plan snapshot tests; shadow diffing; 0.7.0 deletion gate |
 | 5 | Rolling-deploy version skew (4 replicas, one queue) | `planHash` pinned at enqueue; lease-time hash check; CI skew test |
@@ -592,7 +639,10 @@ deferred until reconciliation actually consumes it.
 - **Plan snapshots**: `FlowPlan` is data — snapshot per flow per vendor; a plan diff in review
   IS the flow-change review surface.
 - **Journal conformance**: one suite, three stores, mirroring the existing `store.test.ts`
-  pattern; covers seq monotonicity, concurrent append, TTL.
+  pattern; covers seq monotonicity, racing concurrent appends (gapless, list-ordered seqs), TTL.
+- **State-schema conformance**: every registered flow's `FlowStateSpec` must encode to JSON
+  primitives/arrays/records only — the volatile-handle fence of §4 — paired with the ESLint
+  ban on `Schema.declare`/`Schema.Any` in flow-state positions.
 - **Trace conformance**: the 0.6.x/0.7.0 gate harness — recorded step traces from legacy
   compositions vs the fold, byte-compared, including failure paths (`failed_pre_submit`,
   `reconcile_required`, `PAYMENT_BYPASS_NOT_PROVEN`).
@@ -675,9 +725,9 @@ Three judges, three lenses:
 
 Majority: **effect-native**. All judge-mandated grafts are in §§4-11; every fatal flaw called
 by any judge is eliminated (append-only journal, structural edge verification, flag + shadow
-rollout, idempotency-class gating, confirmation probe, volatile-state exclusion, Layer
-substitution, de-tenanting, explicit segment scoping, checkpoint writes off the SETNX path, no
-JSON authoring).
+rollout, idempotency-class gating, confirmation probe, volatile-state exclusion (as enforced
+convention, §4), Layer substitution, de-tenanting, explicit segment scoping, checkpoint writes
+off the SETNX path, no JSON authoring).
 
 Recorded tradeoffs where judges disagreed:
 

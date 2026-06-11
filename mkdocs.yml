@@ -8,7 +8,11 @@ theme:
     - navigation.indexes
 markdown_extensions:
   - admonition
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.snippets
 nav:
   - Home: index.md
@@ -16,4 +20,6 @@ nav:
   - Runtime Contract: runtime-contract.md
   - Build And Release: build-and-release.md
   - Consumers: consumers.md
+  - Design:
+      - Flow DAG Formalization (TIN-1993): design/flow-dag-formalization.md
   - Generated Facts: generated/repo-facts.md

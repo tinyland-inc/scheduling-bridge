@@ -28,6 +28,11 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 
 ## Release Surface
 
+- delivery SSOT: Bazel module graph via the `tinyland-inc/bazel-registry`
+- derived package: GitHub Packages `@jesssullivan/scheduling-bridge` built
+  from the Bazel `//:pkg` artifact
+- npmjs publish mode: `disabled` (npmjs frozen at `0.5.11`,
+  retired for new versions)
 - Bazel artifact target: `//:pkg`
 - CI package directory: `./bazel-bin/pkg`
 - Publish package directory: `./bazel-bin/pkg`

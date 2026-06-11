@@ -39,7 +39,7 @@ That makes this repo central to the migration paper and to the operational beta-
 
 ## Current Tracking
 
-As of `2026-05-10`, the active structural work here is:
+As of `2026-06-11`, the active structural work here is:
 
 - `TIN-89` package, Bazel, CI, publish, and dependency truth across shared
   scheduling packages
@@ -52,8 +52,12 @@ As of `2026-05-10`, the active structural work here is:
 
 Operationally relevant truth:
 
-- current package metadata is `@tummycrypt/scheduling-bridge` `0.5.11`
-- `0.5.11` depends on `@tummycrypt/scheduling-kit ^0.8.0`
+- current package metadata is `@tummycrypt/scheduling-bridge` `0.5.13`,
+  delivered through GitHub Packages as `@jesssullivan/scheduling-bridge`
+- npmjs is frozen at `0.5.11` and retired for new versions; existing npmjs
+  consumers keep resolving the frozen versions
+- `0.5.13` depends on `@tummycrypt/scheduling-kit ^0.8.0` (npm metadata) and
+  `tummycrypt_scheduling_kit` `0.8.0` (Bazel module graph)
 - the `0.5.x` line is the async bridge redesign lane: async booking jobs,
   availability snapshots, Redis/Postgres async stores, and request-path
   availability prewarm enqueueing
@@ -196,19 +200,26 @@ pnpm build
 pnpm docs:generate
 ```
 
-Current publish flow targets:
+Delivery doctrine:
 
-- npm as `@tummycrypt/scheduling-bridge`
-- GitHub Packages as `@jesssullivan/scheduling-bridge`
+- the Bzlmod module graph through `tinyland-inc/bazel-registry` is the SSOT
+  delivery mechanism
+- GitHub Packages `@jesssullivan/scheduling-bridge` is the derived
+  out-of-ecosystem package, built from the Bazel `//:pkg` artifact
+  (`./bazel-bin/pkg`)
+- npmjs `@tummycrypt/scheduling-bridge` is retired for new versions and frozen
+  at `0.5.11`; `npm_publish_mode: disabled` is permanent policy, not a
+  temporary outage
 
 The canonical GitHub repo is `Jesssullivan/scheduling-bridge`; historical
-`Jesssullivan/acuity-middleware` URLs may redirect. The npm package name is
-`@tummycrypt/scheduling-bridge`. Preserve that distinction.
+`Jesssullivan/acuity-middleware` URLs may redirect. The npm-style package name
+remains `@tummycrypt/scheduling-bridge`. Preserve that distinction.
 
 Current CI and publish workflows use the shared `js-bazel-package` workflow with:
 
 - `runner_mode: shared`
 - `publish_mode: same_runner`
+- `npm_publish_mode: disabled` in the publish workflow (npmjs lane retired)
 - `bazel_targets: "//:pkg"`
 - `package_dir: ./bazel-bin/pkg`
 

@@ -7,6 +7,9 @@ Purpose:
 - migration bridge between Acuity and a future homegrown backend
 
 Authority:
+- delivery SSOT is the Bazel module graph via the `tinyland-inc/bazel-registry`
+- GitHub Packages `@jesssullivan/scheduling-bridge` is the derived package built from the Bazel `//:pkg` artifact
+- npmjs publish mode is `disabled`; npmjs is frozen at `0.5.11` and retired for new versions
 - Bazel artifact truth is `//:pkg`
 - `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`
 - CI and publish extract `./bazel-bin/pkg` / `./bazel-bin/pkg`

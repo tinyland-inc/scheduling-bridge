@@ -10,6 +10,23 @@ The release path is artifact-first.
 6. Deploy Docker and K8s/container runtimes from the same materialized package
    surface.
 
+## Delivery Doctrine
+
+Package delivery follows one source of truth:
+
+1. The Bzlmod module graph is the canonical (SSOT) delivery mechanism.
+   Consumers depend on `tummycrypt_scheduling_bridge` through the
+   `tinyland-inc/bazel-registry` registry line already present in `.bazelrc`.
+2. GitHub Packages (`@jesssullivan/scheduling-bridge`) is a derived package:
+   the out-of-ecosystem alternative route for npm-style consumers, built from
+   the same Bazel `//:pkg` output (`./bazel-bin/pkg`) that the module graph
+   models.
+3. npmjs (`@tummycrypt/scheduling-bridge`) is retired for first-party
+   delivery. It is frozen at `0.5.11`, and `npm_publish_mode: disabled` in the
+   publish workflow is permanent policy, not a temporary outage. Existing
+   npmjs consumers keep resolving the frozen versions; consumer migration is
+   tracked separately.
+
 ## Commands
 
 ```bash
@@ -79,18 +96,20 @@ with local fallback available when the remote cache is unavailable.
 
 Before cutting a bridge release, verify these surfaces together:
 
-- npm package: `@tummycrypt/scheduling-bridge`
-- GitHub Packages package: `@jesssullivan/scheduling-bridge`
+- Bazel registry entry in `tinyland-inc/bazel-registry` for the new version
+  (the SSOT delivery surface)
+- GitHub Packages package: `@jesssullivan/scheduling-bridge`, derived from the
+  Bazel `//:pkg` artifact
 - tag and GitHub release for the package version
 - Bazel package artifact from `./bazel-bin/pkg`
 - Docker and K8s/container runtime images built from the materialized `pkg/`
   surface
 - `/health` release tuple for the deployed bridge
+- npmjs stays frozen: `@tummycrypt/scheduling-bridge` is retired at `0.5.11`,
+  and `npm_publish_mode: disabled` must remain in the publish workflow
 
-The shared `js-bazel-package` workflow owns npm provenance when running on
-eligible hosted runners. SBOM or package attestation beyond npm provenance is
-deferred to the shared workflow contract so this repo does not grow a parallel
-release authority.
+SBOM or package attestation beyond the shared workflow contract is deferred so
+this repo does not grow a parallel release authority.
 
 ## Nix
 

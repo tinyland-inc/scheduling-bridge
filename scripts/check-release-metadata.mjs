@@ -316,14 +316,24 @@ const checks = [
     expected: './bazel-bin/pkg',
   },
   {
-    label: 'publish npm provenance',
+    label: 'publish npm publish mode',
     actual: scalar(
       extract(
         publishWorkflow,
-        /npm_publish_provenance:\s*([^\n]+)/,
-        'publish npm provenance',
+        /npm_publish_mode:\s*([^\n]+)/,
+        'publish npm_publish_mode',
       ),
     ),
+    expected: 'disabled',
+  },
+  {
+    label: 'publish omits npm provenance',
+    actual: String(!/npm_publish_provenance:/.test(publishWorkflow)),
+    expected: 'true',
+  },
+  {
+    label: 'publish omits npm token',
+    actual: String(!/NPM_TOKEN/.test(publishWorkflow)),
     expected: 'true',
   },
   {

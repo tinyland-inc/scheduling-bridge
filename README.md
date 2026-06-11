@@ -310,15 +310,20 @@ pnpm dev
 Current release authority:
 
 - canonical repo: `Jesssullivan/scheduling-bridge`
-- npm package: `@tummycrypt/scheduling-bridge`
-- GitHub Packages mirror: `@jesssullivan/scheduling-bridge`
+- SSOT delivery mechanism: the Bzlmod module graph
+  (`tummycrypt_scheduling_bridge`) via `tinyland-inc/bazel-registry`
+- derived package: GitHub Packages `@jesssullivan/scheduling-bridge`, built
+  from the Bazel `//:pkg` artifact
+- npmjs (`@tummycrypt/scheduling-bridge`): retired for new versions, frozen at
+  `0.5.11`; `npm_publish_mode: disabled` is permanent policy
 
 The current publish + deploy shape is:
 
 1. release metadata declared once
 2. Bazel validates/builds the publishable artifact
 3. CI dry-runs the extracted Bazel package surface before release
-4. GitHub Actions publishes that extracted artifact
+4. GitHub Actions publishes the derived GitHub Packages artifact while the
+   Bazel registry carries the module graph truth
 5. infrastructure can deploy the K8s/container runtime from the same package
    artifact and image entrypoint
 6. downstream apps consume the published package and verify the live runtime
@@ -331,7 +336,9 @@ not duplicate bridge runtime ownership or release truth logic.
 ## Runner Authority
 
 Package CI and publish currently use the shared `js-bazel-package` workflow with
-`runner_mode: shared` and `publish_mode: same_runner`.
+`runner_mode: shared` and `publish_mode: same_runner`. The publish workflow sets
+`npm_publish_mode: disabled` and carries no npm token; npmjs publication is
+retired.
 
 The concrete shared-runner labels come from repository Actions variables and
 must be proven by green workflow runs before they are treated as operational

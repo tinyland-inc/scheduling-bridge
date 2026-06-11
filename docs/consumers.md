@@ -2,7 +2,13 @@
 
 Current downstream consumers should depend on the published package:
 
-- npm package: `@tummycrypt/scheduling-bridge`
+- SSOT delivery: the Bazel module `tummycrypt_scheduling_bridge` via
+  `tinyland-inc/bazel-registry`
+- derived npm-style route: GitHub Packages `@jesssullivan/scheduling-bridge`,
+  built from the Bazel `//:pkg` artifact
+- npmjs `@tummycrypt/scheduling-bridge` is retired for new versions and frozen
+  at `0.5.11`; existing npmjs consumers (MassageIthaca pins `^0.5.11`) keep
+  resolving the frozen versions, and consumer migration is tracked separately
 - primary app consumer: `MassageIthaca`
 - reusable library peer: `@tummycrypt/scheduling-kit`
 

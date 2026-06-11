@@ -113,6 +113,11 @@ const publishPackageDir = extract(
   /package_dir:\s*([^\n]+)/,
   'publish package directory',
 ).trim();
+const publishNpmMode = extract(
+  publishWorkflow,
+  /npm_publish_mode:\s*([^\n]+)/,
+  'publish npm publish mode',
+).trim();
 const protocolVersion = extract(
   healthTs,
   /BRIDGE_PROTOCOL_VERSION = '([^']+)'/,
@@ -172,6 +177,11 @@ This page is generated from \`package.json\`, \`MODULE.bazel\`, \`BUILD.bazel\`,
 
 ## Release Surface
 
+- delivery SSOT: Bazel module graph via the \`tinyland-inc/bazel-registry\`
+- derived package: GitHub Packages \`@jesssullivan/scheduling-bridge\` built
+  from the Bazel \`//:pkg\` artifact
+- npmjs publish mode: \`${publishNpmMode}\` (npmjs frozen at \`0.5.11\`,
+  retired for new versions)
 - Bazel artifact target: \`${ciBazelTargets}\`
 - CI package directory: \`${ciPackageDir}\`
 - Publish package directory: \`${publishPackageDir}\`
@@ -224,6 +234,9 @@ const llms = [
   '- migration bridge between Acuity and a future homegrown backend',
   '',
   'Authority:',
+  '- delivery SSOT is the Bazel module graph via the `tinyland-inc/bazel-registry`',
+  '- GitHub Packages `@jesssullivan/scheduling-bridge` is the derived package built from the Bazel `//:pkg` artifact',
+  `- npmjs publish mode is \`${publishNpmMode}\`; npmjs is frozen at \`0.5.11\` and retired for new versions`,
   `- Bazel artifact truth is \`${ciBazelTargets}\``,
   '- `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`',
   `- CI and publish extract \`${ciPackageDir}\` / \`${publishPackageDir}\``,

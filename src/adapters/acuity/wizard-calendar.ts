@@ -19,6 +19,26 @@ export const MONTH_NAMES: readonly string[] = [
 	'july', 'august', 'september', 'october', 'november', 'december',
 ];
 
+export interface CalendarMonth {
+	readonly month: number;
+	readonly year: number;
+}
+
+export const MAX_CALENDAR_NAVIGATION_STEPS = 36;
+
+export const parseYearMonthKey = (value: string): CalendarMonth | null => {
+	const match = value.match(/^(\d{4})-(\d{2})$/);
+	if (!match) return null;
+
+	const year = Number(match[1]);
+	const month = Number(match[2]) - 1;
+	if (!Number.isInteger(year) || !Number.isInteger(month) || month < 0 || month > 11) {
+		return null;
+	}
+
+	return { month, year };
+};
+
 // =============================================================================
 // CALENDAR MONTH PARSING
 // =============================================================================
@@ -32,7 +52,7 @@ export const MONTH_NAMES: readonly string[] = [
  */
 export const getCurrentCalendarMonth = (
 	page: Page,
-): Effect.Effect<{ month: number; year: number } | null, never> =>
+): Effect.Effect<CalendarMonth | null, never> =>
 	Effect.gen(function* () {
 		for (let attempt = 0; attempt < 3; attempt++) {
 			if (attempt > 0) {
@@ -128,7 +148,7 @@ export const clickCalendarNav = (
 
 /**
  * Navigate the calendar to a target month/year.
- * Clicks prev/next up to 12 times to reach the target.
+ * Clicks prev/next up to MAX_CALENDAR_NAVIGATION_STEPS times to reach the target.
  */
 export const navigateToMonth = (
 	page: Page,
@@ -147,7 +167,7 @@ export const navigateToMonth = (
 			),
 		);
 
-		for (let i = 0; i < 12; i++) {
+		for (let i = 0; i <= MAX_CALENDAR_NAVIGATION_STEPS; i++) {
 			const current = yield* getCurrentCalendarMonth(page);
 			if (!current) {
 				return yield* Effect.fail(new WizardStepError({
@@ -158,6 +178,8 @@ export const navigateToMonth = (
 
 			if (current.month === targetMonth && current.year === targetYear) return;
 
+			if (i === MAX_CALENDAR_NAVIGATION_STEPS) break;
+
 			const currentFirst = new Date(current.year, current.month, 1);
 			const targetFirst = new Date(targetYear, targetMonth, 1);
 			const direction = targetFirst > currentFirst ? 'next' : 'prev';
@@ -165,10 +187,10 @@ export const navigateToMonth = (
 			yield* clickCalendarNav(page, direction, step);
 		}
 
-		// If we exhausted 12 iterations, fail
+		// If we exhausted the navigation budget, fail.
 		return yield* Effect.fail(new WizardStepError({
 			step: step as WizardStepError['step'],
-			message: `Could not navigate to ${MONTH_NAMES[targetMonth]} ${targetYear} within 12 steps`,
+			message: `Could not navigate to ${MONTH_NAMES[targetMonth]} ${targetYear} within ${MAX_CALENDAR_NAVIGATION_STEPS} steps`,
 		}));
 	});
 

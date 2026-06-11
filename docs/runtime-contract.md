@@ -1,36 +1,34 @@
 # Runtime Contract
 
-## Stable Surfaces
+`GET /health` is the bridge runtime truth surface.
 
-- `GET /health`
-- `GET /services`
-- `GET /services/:id`
-- `POST /availability/dates`
-- `POST /availability/slots`
-- `POST /availability/check`
-- `POST /booking/create`
-- `POST /booking/create-with-payment`
+Downstream apps should use it to verify:
 
-## Health Tuple
+- bridge release SHA, ref, version, and build timestamp
+- protocol version
+- flow owner
+- backend
+- transport
+- endpoint and capability shape
 
-`GET /health` is the release and protocol truth surface. Downstream apps should verify:
+Package metadata says what a consumer compiled against. `/health` says what the
+deployed bridge is actually running. Promotion and beta validation should check
+both when claims depend on the live bridge.
 
-- release identity: SHA, ref, version, build time
-- transport identity: `http-json`
-- flow owner: `scheduling-bridge`
-- backend: `acuity`
-- protocol version and capabilities
+## Provider Truth
 
-Do not infer deployment truth from branch names, package metadata alone, or dashboard state
-when `/health` is available.
+The bridge contract is provider-agnostic: a Node HTTP server exposing the
+protocol endpoints and `/health` tuple.
 
-## Supported Runtime Targets
-
-- Modal is the current primary remote deployment surface.
-- Docker must mirror the same built Node entrypoint as Modal.
-- K8s work is active, but it is not the only authoritative runtime until promotion work closes.
-
-## Entry Point Rule
-
-All supported runtime targets must launch `dist/server/handler.js`.
-If Docker, Modal, or future K8s manifests drift from that entrypoint, treat it as an operational bug.
+- K8s/container execution is the accepted next-production bridge route and is
+  the current MassageIthaca K8s shadow runtime.
+- Modal is legacy proofing context. Automatic Modal deploys are disabled; the
+  manual workflow requires explicit acknowledgement while TIN-981 closes the
+  surface.
+- Provider state, tailnet exposure, and public-edge routing are managed by the
+  infrastructure repo.
+- Docker is the local/container compatibility target and must mirror the same
+  `dist/server/handler.js` entrypoint.
+- Consumer apps should name the remote endpoint with `SCHEDULING_BRIDGE_URL`
+  and `SCHEDULING_BRIDGE_AUTH_TOKEN`; legacy `MODAL_*` aliases are transition
+  compatibility, not the forward contract.

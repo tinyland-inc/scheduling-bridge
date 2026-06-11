@@ -7,7 +7,15 @@ import {
 	observePageOpEffect,
 	recordCacheHit,
 	recordCacheMiss,
+	recordAvailabilityHeartbeatJob,
+	recordAvailabilityReadinessCheck,
+	recordAvailabilityReadinessScope,
+	recordAvailabilitySnapshotServed,
+	recordAvailabilitySnapshotRead,
 	renderMetrics,
+	setAvailabilitySnapshotAge,
+	setBridgeQueueDepth,
+	setBridgeQueueOldestAge,
 	trackBrowserSession,
 } from './metrics.js';
 
@@ -15,10 +23,27 @@ describe('metrics', () => {
 	it('exposes required SLIs from spec §6.1', () => {
 		const names = metrics.registry.getMetricsAsArray().map((m) => m.name);
 		expect(names).toContain('acuity_browser_active_sessions');
+		expect(names).toContain('acuity_browser_page_limiter_active');
+		expect(names).toContain('acuity_browser_page_limiter_queued');
+		expect(names).toContain('acuity_browser_page_acquire_duration_seconds');
+		expect(names).toContain('acuity_browser_page_acquire_timeouts_total');
 		expect(names).toContain('acuity_page_operations_duration_seconds');
 		expect(names).toContain('acuity_cache_hit_ratio');
 		expect(names).toContain('acuity_service_catalog_scrape_total');
 		expect(names).toContain('acuity_service_catalog_refresh_duration_seconds');
+		expect(names).toContain('acuity_bridge_read_cache_events_total');
+		expect(names).toContain('acuity_bridge_read_cache_wait_duration_seconds');
+		expect(names).toContain('acuity_bridge_read_duration_seconds');
+		expect(names).toContain('acuity_availability_snapshot_served_total');
+		expect(names).toContain(
+			'acuity_availability_snapshot_read_duration_seconds',
+		);
+		expect(names).toContain('acuity_availability_heartbeat_jobs_total');
+		expect(names).toContain('acuity_availability_readiness_checks_total');
+		expect(names).toContain('acuity_availability_readiness_scope_total');
+		expect(names).toContain('acuity_bridge_queue_depth');
+		expect(names).toContain('acuity_bridge_queue_oldest_age_seconds');
+		expect(names).toContain('acuity_availability_snapshot_age_seconds');
 	});
 
 	it('renders Prometheus text format', async () => {
@@ -28,6 +53,8 @@ describe('metrics', () => {
 		const text = await renderMetrics();
 		expect(text).toContain('# HELP acuity_browser_active_sessions');
 		expect(text).toContain('# TYPE acuity_browser_active_sessions gauge');
+		expect(text).toContain('# HELP acuity_browser_page_limiter_active');
+		expect(text).toContain('# TYPE acuity_browser_page_limiter_queued gauge');
 		// Histogram exposition: per-bucket cumulative, total sum, total count.
 		expect(text).toContain('acuity_page_operations_duration_seconds_bucket{');
 		expect(text).toContain('acuity_page_operations_duration_seconds_sum');
@@ -47,6 +74,233 @@ describe('metrics', () => {
 				(v) => v.labels.source === 'lock_winner',
 			)?.value ?? 0;
 		expect(after).toBe(before + 1);
+	});
+});
+
+describe('bridge read cache metrics wiring', () => {
+	const counterValue = async (
+		cacheKind: string,
+		event: string,
+	): Promise<number> => {
+		const snap = await metrics.bridgeReadCacheEventsTotal.get();
+		return (
+			snap.values.find(
+				(v) => v.labels.cache_kind === cacheKind && v.labels.event === event,
+			)?.value ?? 0
+		);
+	};
+
+	const histogramCount = async (
+		metricName: string,
+		labels: Record<string, string>,
+	): Promise<number> => {
+		const metric = metrics.registry.getSingleMetric(metricName);
+		const snap = await metric?.get();
+		const countName = `${metricName}_count`;
+		return (
+			snap?.values.find((v) => {
+				if (v.metricName !== countName) return false;
+				return Object.entries(labels).every(
+					([key, value]) => v.labels[key] === value,
+				);
+			})?.value ?? 0
+		);
+	};
+
+	it('increments fixed-label cache event counters', async () => {
+		const before = await counterValue('availability_slots', 'hit');
+		metrics.recordBridgeReadCacheEvent('availability_slots', 'hit');
+		const after = await counterValue('availability_slots', 'hit');
+		expect(after).toBe(before + 1);
+	});
+
+	it('records wait duration samples by outcome', async () => {
+		const before = await histogramCount(
+			'acuity_bridge_read_cache_wait_duration_seconds',
+			{
+				cache_kind: 'availability_slots',
+				outcome: 'hit',
+			},
+		);
+		metrics.recordBridgeReadCacheWait('availability_slots', 'hit', 250);
+		const after = await histogramCount(
+			'acuity_bridge_read_cache_wait_duration_seconds',
+			{
+				cache_kind: 'availability_slots',
+				outcome: 'hit',
+			},
+		);
+		expect(after).toBe(before + 1);
+	});
+
+	it('records uncached bridge read duration samples', async () => {
+		const before = await histogramCount('acuity_bridge_read_duration_seconds', {
+			cache_kind: 'availability_dates',
+		});
+		await metrics.observeBridgeRead('availability_dates', async () => 42);
+		const after = await histogramCount('acuity_bridge_read_duration_seconds', {
+			cache_kind: 'availability_dates',
+		});
+		expect(after).toBe(before + 1);
+	});
+
+	it('increments snapshot-served counters by kind and freshness', async () => {
+		const snapshotCounter = async (
+			kind: string,
+			freshness: string,
+		): Promise<number> => {
+			const snap = await metrics.availabilitySnapshotServedTotal.get();
+			return (
+				snap.values.find(
+					(v) => v.labels.kind === kind && v.labels.freshness === freshness,
+				)?.value ?? 0
+			);
+		};
+
+		const before = await snapshotCounter('slots', 'stale');
+		recordAvailabilitySnapshotServed('slots', 'stale');
+		const after = await snapshotCounter('slots', 'stale');
+		expect(after).toBe(before + 1);
+	});
+
+	it('records durable snapshot read duration samples by layer outcome', async () => {
+		const before = await histogramCount(
+			'acuity_availability_snapshot_read_duration_seconds',
+			{
+				kind: 'dates',
+				freshness: 'fresh',
+				outcome: 'hit',
+			},
+		);
+		recordAvailabilitySnapshotRead('dates', 'fresh', 'hit', 12);
+		const after = await histogramCount(
+			'acuity_availability_snapshot_read_duration_seconds',
+			{
+				kind: 'dates',
+				freshness: 'fresh',
+				outcome: 'hit',
+			},
+		);
+		expect(after).toBe(before + 1);
+	});
+
+	it('increments heartbeat decision counters', async () => {
+		const heartbeatCounter = async (
+			kind: string,
+			action: string,
+		): Promise<number> => {
+			const snap = await metrics.availabilityHeartbeatJobsTotal.get();
+			return (
+				snap.values.find(
+					(v) => v.labels.kind === kind && v.labels.action === action,
+				)?.value ?? 0
+			);
+		};
+
+		const before = await heartbeatCounter('dates', 'queued');
+		recordAvailabilityHeartbeatJob('dates', 'queued');
+		const after = await heartbeatCounter('dates', 'queued');
+		expect(after).toBe(before + 1);
+	});
+
+	it('records readiness counters and gauges', async () => {
+		const readinessCounter = async (result: string): Promise<number> => {
+			const snap = await metrics.availabilityReadinessChecksTotal.get();
+			return snap.values.find((v) => v.labels.result === result)?.value ?? 0;
+		};
+		const scopeCounter = async (
+			kind: string,
+			freshness: string,
+		): Promise<number> => {
+			const snap = await metrics.availabilityReadinessScopeTotal.get();
+			return (
+				snap.values.find(
+					(v) => v.labels.kind === kind && v.labels.freshness === freshness,
+				)?.value ?? 0
+			);
+		};
+
+		const readyBefore = await readinessCounter('ready');
+		const scopeBefore = await scopeCounter('dates', 'fresh');
+		recordAvailabilityReadinessCheck(true);
+		recordAvailabilityReadinessScope('dates', 'fresh');
+		setBridgeQueueDepth('availability_dates_refresh', 'queued', 3);
+		setBridgeQueueOldestAge('availability_dates_refresh', 2500);
+		setAvailabilitySnapshotAge('dates', '53178494', '2026-06', 1500);
+
+		expect(await readinessCounter('ready')).toBe(readyBefore + 1);
+		expect(await scopeCounter('dates', 'fresh')).toBe(scopeBefore + 1);
+		const queueDepth = await metrics.bridgeQueueDepth.get();
+		expect(
+			queueDepth.values.find(
+				(v) =>
+					v.labels.kind === 'availability_dates_refresh' &&
+					v.labels.status === 'queued',
+			)?.value,
+		).toBe(3);
+		const queueAge = await metrics.bridgeQueueOldestAgeSeconds.get();
+		expect(
+			queueAge.values.find(
+				(v) => v.labels.kind === 'availability_dates_refresh',
+			)?.value,
+		).toBe(2.5);
+		const snapshotAge = await metrics.availabilitySnapshotAgeSeconds.get();
+		expect(
+			snapshotAge.values.find(
+				(v) =>
+					v.labels.kind === 'dates' &&
+					v.labels.service_id === '53178494' &&
+					v.labels.scope === '2026-06',
+			)?.value,
+		).toBe(1.5);
+	});
+});
+
+describe('browser page limiter metrics wiring', () => {
+	const gaugeValue = async (metricName: string): Promise<number> => {
+		const metric = metrics.registry.getSingleMetric(metricName);
+		const snap = await metric?.get();
+		return (snap?.values[0]?.value as number | undefined) ?? 0;
+	};
+
+	const histogramCount = async (outcome: string): Promise<number> => {
+		const snap = await metrics.browserPageAcquireDuration.get();
+		return (
+			snap.values.find(
+				(v) =>
+					v.metricName ===
+						'acuity_browser_page_acquire_duration_seconds_count' &&
+					v.labels.outcome === outcome,
+			)?.value ?? 0
+		);
+	};
+
+	const timeoutCount = async (): Promise<number> => {
+		const snap = await metrics.browserPageAcquireTimeoutsTotal.get();
+		return (snap.values[0]?.value as number | undefined) ?? 0;
+	};
+
+	it('records limiter active and queued gauges', async () => {
+		metrics.setBrowserPageLimiterState(2, 1);
+		expect(await gaugeValue('acuity_browser_page_limiter_active')).toBe(2);
+		expect(await gaugeValue('acuity_browser_page_limiter_queued')).toBe(1);
+
+		metrics.setBrowserPageLimiterState(0, 0);
+		expect(await gaugeValue('acuity_browser_page_limiter_active')).toBe(0);
+		expect(await gaugeValue('acuity_browser_page_limiter_queued')).toBe(0);
+	});
+
+	it('records acquire duration and timeout counters', async () => {
+		const successBefore = await histogramCount('success');
+		const timeoutBefore = await histogramCount('timeout');
+		const timeoutCounterBefore = await timeoutCount();
+
+		metrics.recordBrowserPageAcquire('success', 25);
+		metrics.recordBrowserPageAcquire('timeout', 10000);
+
+		expect(await histogramCount('success')).toBe(successBefore + 1);
+		expect(await histogramCount('timeout')).toBe(timeoutBefore + 1);
+		expect(await timeoutCount()).toBe(timeoutCounterBefore + 1);
 	});
 });
 
@@ -87,7 +341,8 @@ describe('pageOperationsDuration wiring', () => {
 			const snap = await metrics.pageOperationsDuration.get();
 			// `_count` lines have `metricName: <name>_count` and the matching operation label.
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
+				(v) =>
+					v.metricName === 'acuity_page_operations_duration_seconds_count' &&
 					v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
@@ -103,7 +358,8 @@ describe('pageOperationsDuration wiring', () => {
 		const bucketCountFor = async (op: string): Promise<number> => {
 			const snap = await metrics.pageOperationsDuration.get();
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
+				(v) =>
+					v.metricName === 'acuity_page_operations_duration_seconds_count' &&
 					v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
@@ -123,14 +379,17 @@ describe('pageOperationsDuration wiring', () => {
 		const bucketCountFor = async (op: string): Promise<number> => {
 			const snap = await metrics.pageOperationsDuration.get();
 			const row = snap.values.find(
-				(v) => v.metricName === 'acuity_page_operations_duration_seconds_count' &&
+				(v) =>
+					v.metricName === 'acuity_page_operations_duration_seconds_count' &&
 					v.labels.operation === op,
 			);
 			return (row?.value as number | undefined) ?? 0;
 		};
 
 		const before = await bucketCountFor('effect_op');
-		await Effect.runPromise(observePageOpEffect('effect_op', Effect.succeed(42)));
+		await Effect.runPromise(
+			observePageOpEffect('effect_op', Effect.succeed(42)),
+		);
 		const after = await bucketCountFor('effect_op');
 		expect(after).toBe(before + 1);
 	});
@@ -152,9 +411,11 @@ describe('browserActiveSessions wiring', () => {
 			trackBrowserSession(
 				Effect.sync(() => {
 					// Synchronous peek while the session is "held".
-					const row = (metrics.browserActiveSessions as unknown as {
-						hashMap: Map<string, { value: number }>;
-					}).hashMap;
+					const row = (
+						metrics.browserActiveSessions as unknown as {
+							hashMap: Map<string, { value: number }>;
+						}
+					).hashMap;
 					// Fallback to prom-client async snapshot if the internal
 					// structure changes in future versions.
 					void row;
@@ -184,7 +445,8 @@ describe('browserActiveSessions wiring', () => {
 			trackBrowserSession(
 				Effect.promise(async () => {
 					const snap = await metrics.browserActiveSessions.get();
-					observedWhileHeld = (snap.values[0]?.value as number | undefined) ?? 0;
+					observedWhileHeld =
+						(snap.values[0]?.value as number | undefined) ?? 0;
 				}),
 			),
 		);

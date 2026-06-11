@@ -1,39 +1,21 @@
 # Architecture
 
-## Request Flow
+The bridge wraps Acuity's public booking UI behind a stable HTTP contract.
 
 ```text
 HTTP request
 -> src/server/handler.ts
--> shared service-catalog resolution
--> adapter step programs
--> BrowserService / BrowserProcess Effect layers
--> Playwright page session
--> Acuity UI
+-> shared service catalog resolution
+-> Acuity wizard steps
+-> browser/page lifecycle layer
+-> Playwright against Acuity
 ```
 
-## Ownership Boundary
+The important boundary is ownership: this repo owns the remote automation
+service, not the downstream application UX. Consumer apps should call the
+published package and deployed bridge endpoint instead of copying selector,
+browser, Modal, or Acuity DOM logic.
 
-- This repo owns browser automation, remote bridge endpoints, and runtime packaging.
-- `@tummycrypt/scheduling-kit` owns backend-agnostic scheduling contracts and shared primitives.
-- `MassageIthaca` is an adopter; it should consume bridge exports instead of duplicating bridge logic.
-
-## Effect Usage
-
-Effect belongs where lifecycle and failure semantics are real:
-
-- warm browser process startup and reuse
-- request-scoped page acquisition and release
-- retryable step orchestration
-- typed failure mapping back to HTTP or downstream adapter callers
-
-Keep synchronous utility code simple. Do not introduce Effect wrappers where there is no
-resource boundary, retry surface, or compositional correctness benefit.
-
-## Runtime Shape
-
-- `src/server/handler.ts` is the real HTTP entrypoint.
-- `src/server/health.ts` defines the supported protocol and release tuple.
-- `src/shared/browser-service.ts` is the browser resource boundary.
-- `src/shared/acuity-service-catalog.ts` is the service truth aggregator.
-- `src/shared/remote-adapter.ts` is the downstream consumer surface for remote mode.
+Effect is useful here because browser and page lifecycle are real resource
+management problems. Keep that usage near lifecycle, retry, and orchestration
+boundaries; do not add abstraction where synchronous code is clearer.

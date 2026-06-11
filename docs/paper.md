@@ -7,7 +7,7 @@ Tinyland Inc.
 [acuity-middleware-paper.tex](paper/acuity-middleware-paper.tex)
 ## Abstract
 
-Small-business SaaS platforms create vendor lock-in through API paywalls and proprietary data formats. We present a typed browser automation architecture that functions as an anti-corruption layer, implementing a standardized 17-method scheduling adapter interface by puppeteering the vendor's public-facing web UI via headless Playwright. The adapter interface is defined in a standalone library (`scheduling-kit`), while vendor-specific automation lives in a separate adapter hub (`scheduling-bridge`) -- establishing a pattern where each locked-in SaaS backend (Acuity, CalCom, GlossGenius) gets its own adapter package, giving small businesses a reusable FOSS offramp from proprietary scheduling services. A feature-flag-driven backend selector implements the strangler fig pattern, routing scheduling operations to either the legacy vendor (via browser automation on Modal Labs) or a homegrown PostgreSQL backend (via direct queries), enabling zero-downtime migration with instant rollback. The system has been deployed in production since March 2026, processing real appointment bookings across both backends simultaneously. We report on the architecture, the unified Effect TS functional programming approach (typed effect programs for browser lifecycle management, adapter composition, and structured error handling), the reliability challenges of DOM automation against a React SPA with Emotion CSS, and lessons learned from automating 604 legacy appointments across 62 weeks of calendar data. The middleware replaces 8 blocked REST API endpoints through DOM interaction alone, demonstrating that typed browser automation is a viable -- if intentionally temporary -- anti-corruption layer for escaping SaaS vendor lock-in.
+Small-business SaaS platforms create vendor lock-in through API paywalls and proprietary data formats. We present a typed browser automation architecture that functions as an anti-corruption layer, implementing a standardized 17-method scheduling adapter interface by puppeteering the vendor's public-facing web UI via headless Playwright. The adapter interface is defined in a standalone library (`scheduling-kit`), while vendor-specific automation lives in a separate adapter hub (`scheduling-bridge`) -- establishing a pattern where each locked-in SaaS backend (Acuity, CalCom, GlossGenius) gets its own adapter package, giving small businesses a reusable FOSS offramp from proprietary scheduling services. A feature-flag-driven backend selector implements the strangler fig pattern, routing scheduling operations to either the legacy vendor (via headless browser automation) or a homegrown PostgreSQL backend (via direct queries), enabling zero-downtime migration with instant rollback. The system has been deployed in production since March 2026, processing real appointment bookings across both backends simultaneously. We report on the architecture, the unified Effect TS functional programming approach (typed effect programs for browser lifecycle management, adapter composition, and structured error handling), the reliability challenges of DOM automation against a React SPA with Emotion CSS, and lessons learned from automating 604 legacy appointments across 62 weeks of calendar data. The middleware replaces 8 blocked REST API endpoints through DOM interaction alone, demonstrating that typed browser automation is a viable -- if intentionally temporary -- anti-corruption layer for escaping SaaS vendor lock-in.
 
 ---
 
@@ -17,7 +17,7 @@ The modern small business operates on a stack of vertical SaaS products: schedul
 
 Acuity Scheduling, a Squarespace subsidiary, exemplifies this dynamic. The platform provides appointment booking for service businesses (massage therapy, consulting, tutoring) via an embeddable iframe widget and a web-based admin panel. The REST API that would enable programmatic access to appointment data, availability, and booking operations is gated behind the "Powerhouse" plan -- a pricing tier that returns HTTP 403 on all endpoints for lower-tier accounts [1]. The business's own appointment history, client records, and scheduling configuration are accessible only through the web UI.
 
-This paper presents a middleware architecture that solves the migration problem through browser automation. Rather than reverse-engineering the vendor's internal APIs or negotiating for API access, the system drives the vendor's public-facing booking wizard via headless Playwright [2], translating standardized adapter method calls into sequences of DOM interactions. The middleware is deployed as a containerized service on Modal Labs [3], providing serverless scaling with warm container pools for acceptable latency.
+This paper presents a middleware architecture that solves the migration problem through browser automation. Rather than reverse-engineering the vendor's internal APIs or negotiating for API access, the system drives the vendor's public-facing booking wizard via headless Playwright [2], translating standardized adapter method calls into sequences of DOM interactions. The middleware was initially deployed as a containerized service on Modal Labs [3], providing serverless scaling with warm container pools for acceptable latency; production has since migrated to a self-hosted Kubernetes (RKE2) cluster consuming the same container artifact, with Modal retained as a legacy proofing surface.
 
 The key insight is that browser automation middleware is not the destination -- it is the bridge. The architecture implements the strangler fig pattern [4] with a feature-flag-controlled backend selector that routes scheduling operations to either the legacy vendor (via browser automation) or a homegrown PostgreSQL backend (via direct queries). As the homegrown backend reaches feature parity, the browser middleware layer becomes disposable. The adapter interface ensures that consumers of scheduling operations are completely isolated from which backend serves them.
 
@@ -25,7 +25,7 @@ The key insight is that browser automation middleware is not the destination -- 
 
 This paper makes five contributions:
 
-1. A formal 17-method `SchedulingAdapter` interface that abstracts scheduling operations (services, providers, availability, reservations, bookings, clients) across heterogeneous backends, with all methods returning monadic `Effect<T, SchedulingError>` for composable error handling.
+1. A formal 17-method `SchedulingAdapter` interface that abstracts scheduling operations (services, providers, availability, advisory soft holds, bookings, clients) across heterogeneous backends, with all methods returning monadic `Effect<T, SchedulingError>` for composable error handling.
 
 2. An adapter hub architecture (`scheduling-bridge`) that separates the interface definition from vendor-specific implementations, enabling multiple SaaS backends to be wrapped as discrete packages -- a reusable FOSS offramp pattern for small businesses escaping proprietary scheduling services.
 
@@ -55,7 +55,7 @@ Fowler [4] describes the strangler fig pattern as a metaphor for incremental sys
 
 ### D. Anti-Corruption Layer
 
-Evans [10] defines the Anti-Corruption Layer as a pattern for isolating a bounded context from the domain model of an external system. The `SchedulingAdapter` interface serves this role: it prevents Acuity's domain concepts (appointment type IDs, React wizard steps, Square payment integration) from leaking into the homegrown domain model (UUID-based services, slot reservations, Stripe/Venmo payments). The dual-ID resolution pattern in the homegrown adapter -- accepting both UUID and legacy `acuityId` -- is an explicit corruption-containment mechanism.
+Evans [10] defines the Anti-Corruption Layer as a pattern for isolating a bounded context from the domain model of an external system. The `SchedulingAdapter` interface serves this role: it prevents Acuity's domain concepts (appointment type IDs, React wizard steps, Square payment integration) from leaking into the homegrown domain model (UUID-based services, advisory soft holds, Stripe/Venmo payments). The dual-ID resolution pattern in the homegrown adapter -- accepting both UUID and legacy `acuityId` -- is an explicit corruption-containment mechanism.
 
 ### E. Robotic Process Automation
 
@@ -134,9 +134,9 @@ interface SchedulingAdapter {
   getAvailableDates(p: DateParams): SchedulingResult<AvailableDate[]>;
   getAvailableSlots(p: SlotParams): SchedulingResult<TimeSlot[]>;
   checkSlotAvailability(p: CheckParams): SchedulingResult<boolean>;
-  // Reservations (2)
-  createReservation(p: ReserveParams): SchedulingResult<SlotReservation>;
-  releaseReservation(id: string): SchedulingResult<void>;
+  // Advisory soft holds (2)
+  softHoldSlot(p: SoftHoldParams): SchedulingResult<SlotSoftHold>;
+  releaseSoftHold(id: string): SchedulingResult<void>;
   // Bookings (5)
   createBooking(req: BookingRequest): SchedulingResult<Booking>;
   createBookingWithPaymentRef(req, ref, proc): SchedulingResult<Booking>;
@@ -216,9 +216,9 @@ class BrowserService extends Context.Tag('BrowserService')<
 
 The live implementation uses two nested `acquireRelease` pairs: the outer pair manages the browser process (launch on acquire, close on release), the inner pair manages the page instance. Both are scoped to the `Layer` lifetime. When any wizard step program fails -- selector timeout, navigation error, coupon rejection -- the scope unwinds and both resources are released in reverse order.
 
-### C. Modal Labs Deployment
+### C. Modal Labs Deployment (Legacy)
 
-The middleware is deployed on Modal Labs [3] using the official Playwright Docker image as a base. The deployment configuration:
+The middleware was initially deployed on Modal Labs [3] using the official Playwright Docker image as a base; as of May 2026 the production runtime is a self-hosted Kubernetes (RKE2) cluster, and Modal remains a legacy proofing deployment. The Modal deployment configuration:
 
 - **Image**: `mcr.microsoft.com/playwright:v1.58.2-noble` with Node.js 24 LTS
 - **Resources**: 2 CPU cores, 2048 MB memory, no GPU
@@ -249,11 +249,11 @@ The `HomegrownAdapter` implements all 17 `SchedulingAdapter` methods via direct 
 - **Lazy database connection**: The adapter receives a `getDb` factory function, called per-operation. This avoids import-time connections critical for Vercel cold starts.
 - **Lazy schema imports**: Drizzle schema tables are dynamically imported inside each method, preventing the ORM runtime from being bundled into client-side code.
 - **Dual-ID resolution**: `resolveService` accepts both UUID (homegrown) and integer `acuityId` (legacy) via UUID format detection, enabling backward compatibility during migration.
-- **Real slot reservations**: PG-persisted with `expires_at`, unlike the wizard adapter which cannot support reservations through the public UI.
+- **Advisory soft holds**: PG-persisted with `expires_at`, unlike the wizard adapter which cannot support advisory soft holds through the public UI. Correctness still comes from the final booking write plus backend rejection, not from treating a hold as a reservation.
 
 ### F. Availability Engine
 
-The availability engine is a pure-function module with zero database dependency. All data is passed as arguments. The core algorithm generates candidate slots at configurable intervals within business hours, filters out those overlapping with occupied blocks (bookings + time blocks + active reservations), applies buffer time and minimum advance notice constraints. DST safety is achieved via `Intl.DateTimeFormat` with named timezones -- no manual offset tables. The module has 39 dedicated unit tests.
+The availability engine is a pure-function module with zero database dependency. All data is passed as arguments. The core algorithm generates candidate slots at configurable intervals within business hours, filters out those overlapping with occupied blocks (bookings + time blocks + active soft holds), applies buffer time and minimum advance notice constraints. DST safety is achieved via `Intl.DateTimeFormat` with named timezones -- no manual offset tables. The module has 39 dedicated unit tests.
 
 ---
 
@@ -302,12 +302,12 @@ The browser middleware latency is acceptable only as a migration bridge. The two
 | Services | 2 | 2/2 | 2/2 |
 | Providers | 3 | 3/3 (hardcoded) | 3/3 |
 | Availability | 3 | 3/3 | 3/3 |
-| Reservations | 2 | 0/2 (graceful fail) | 2/2 |
+| Advisory soft holds | 2 | 0/2 (graceful fail) | 2/2 |
 | Bookings | 5 | 2/5 | 5/5 |
 | Clients | 2 | 2/2 (pass-through) | 2/2 |
 | **Total** | **17** | **12/17** | **17/17** |
 
-The wizard adapter's incomplete coverage (no `getBooking`, `cancelBooking`, `rescheduleBooking`, slot reservations) reflects the limitations of the public booking UI -- these operations require admin panel access. The homegrown adapter's full coverage demonstrates feature parity.
+The wizard adapter's incomplete coverage (no `getBooking`, `cancelBooking`, `rescheduleBooking`, advisory soft holds) reflects the limitations of the public booking UI -- these operations require admin panel access. The homegrown adapter's full coverage demonstrates feature parity.
 
 ---
 
@@ -346,7 +346,7 @@ The adapter hub uses Bazel as its build system, with each vendor adapter as a di
 
 ## VII. Conclusion
 
-We have presented a typed browser automation architecture that functions as an anti-corruption layer for escaping SaaS vendor lock-in. The system separates the adapter interface (`scheduling-kit`, 17 methods) from vendor-specific automation (`scheduling-bridge`), implementing the strangler fig pattern with feature-flag-driven backend selection. Deployed in production since March 2026, the system serves real appointment bookings across both the legacy vendor (via browser automation on Modal Labs) and a homegrown PostgreSQL backend (via direct queries) simultaneously.
+We have presented a typed browser automation architecture that functions as an anti-corruption layer for escaping SaaS vendor lock-in. The system separates the adapter interface (`scheduling-kit`, 17 methods) from vendor-specific automation (`scheduling-bridge`), implementing the strangler fig pattern with feature-flag-driven backend selection. Deployed in production since March 2026, the system serves real appointment bookings across both the legacy vendor (via browser automation, initially on Modal Labs and now on a self-hosted Kubernetes runtime) and a homegrown PostgreSQL backend (via direct queries) simultaneously.
 
 The browser automation layer is intentionally temporary -- a bridge, not a destination. As the homegrown backend reaches full feature parity (currently 17/17 adapter methods), the middleware becomes disposable. The adapter interface ensures consumers are completely isolated from this transition.
 

@@ -10,10 +10,10 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 ## Package Identity
 
 - package: `@tummycrypt/scheduling-bridge`
-- package version: `0.4.2`
-- Bazel module version: `0.4.2`
-- Bazel package stanza: `@tummycrypt/scheduling-bridge@0.4.2`
-- repository: `git+https://github.com/Jesssullivan/acuity-middleware.git`
+- package version: `0.5.13`
+- Bazel module version: `0.5.13`
+- Bazel package stanza: `@tummycrypt/scheduling-bridge@0.5.13`
+- repository: `git+https://github.com/Jesssullivan/scheduling-bridge.git`
 
 ## Toolchains
 
@@ -22,8 +22,8 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 - flake Node package major: `24`
 - pnpm toolchain: `9.15.9`
 - package manager: `pnpm@9.15.9`
-- engines: `>=24 <26`
-- CI node matrix: `24, 25`
+- engines: `^22.0.0 || ^24.0.0`
+- CI node matrix: `22, 24`
 - CI publish node: `24`
 
 ## Release Surface
@@ -34,9 +34,17 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 - local build command: `node scripts/build-derived-artifacts.mjs`
 - local derived package directory: `pkg/`
 - CI typecheck command: `pnpm typecheck`
-- CI unit test command: `pnpm test`
+- CI unit test command: `pnpm test:host && pnpm test`
 - CI build command: `node scripts/check-artifact-authority.mjs`
 - runtime start command: `node dist/server/handler.js`
+
+## Runtime Provider Truth
+
+- provider-agnostic contract: Node HTTP server plus `/health` tuple
+- accepted next-production provider: K8s/container runtime from infrastructure
+- legacy proofing provider: Modal, automatic deploys disabled during TIN-981
+- forward consumer env names: `SCHEDULING_BRIDGE_URL` and
+  `SCHEDULING_BRIDGE_AUTH_TOKEN`
 
 ## Exported Entry Points
 
@@ -47,7 +55,7 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 
 ## Protocol Surface
 
-- protocol version: `1.0.0`
+- protocol version: `1.2.0`
 - flow owner: `scheduling-bridge`
 - transport: `http-json`
 - backend: `acuity`
@@ -62,8 +70,15 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 | `availabilityDates` | `/availability/dates` |
 | `availabilitySlots` | `/availability/slots` |
 | `availabilityCheck` | `/availability/check` |
+| `availabilityRefresh` | `/availability/refresh` |
+| `availabilitySnapshot` | `/availability/snapshot` |
+| `availabilityHeartbeat` | `/internal/availability/heartbeat` |
+| `availabilityReadiness` | `/internal/availability/readiness` |
+| `availabilityWaitReady` | `/internal/availability/wait-ready` |
 | `bookingCreate` | `/booking/create` |
 | `bookingCreateWithPayment` | `/booking/create-with-payment` |
+| `bookingJobs` | `/booking/jobs` |
+| `jobStatus` | `/jobs/:operationId` |
 
 ### Capabilities
 
@@ -72,8 +87,15 @@ This page is generated from `package.json`, `MODULE.bazel`, `BUILD.bazel`,
 - `availability:dates`
 - `availability:slots`
 - `availability:check`
+- `availability:refresh-async`
+- `availability:snapshot`
+- `availability:heartbeat-internal`
+- `availability:readiness-internal`
+- `availability:wait-ready-internal`
 - `booking:create`
-- `booking:create-with-payment`
+- `booking:create-with-payment:deprecated`
+- `booking:create-with-payment-async`
+- `booking:job-status`
 - `service-catalog:static-fallback`
 - `service-catalog:business-extract`
 - `service-catalog:scraper-fallback`

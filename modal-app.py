@@ -18,7 +18,6 @@ Environment variables (set in Modal dashboard or .env):
 """
 
 import os
-from pathlib import Path
 
 import modal
 
@@ -27,9 +26,6 @@ RELEASE_SHA = os.environ.get("MIDDLEWARE_RELEASE_SHA", "local")
 RELEASE_REF = os.environ.get("MIDDLEWARE_RELEASE_REF", "local")
 RELEASE_VERSION = os.environ.get("MIDDLEWARE_RELEASE_VERSION", "local")
 RELEASE_BUILT_AT = os.environ.get("MIDDLEWARE_RELEASE_BUILT_AT", "")
-
-if not Path("pkg/package.json").exists():
-    raise RuntimeError("Missing derived package artifact at ./pkg. Run `pnpm build` before `modal deploy modal-app.py`.")
 
 app = modal.App(APP_NAME)
 
@@ -46,7 +42,7 @@ image = (
         "MIDDLEWARE_RELEASE_BUILT_AT": RELEASE_BUILT_AT,
     })
     .run_commands(
-        # Replace the bundled Node with the canonical Node 24 LTS runtime lane.
+        # Normalize to the same Node major used by Bazel and CI.
         "apt-get remove -y nodejs || true",
         "rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx",
         "curl -fsSL https://deb.nodesource.com/setup_24.x | bash -",
@@ -55,11 +51,11 @@ image = (
         "corepack enable && corepack prepare pnpm@9.15.9 --activate",
         "apt-get clean && rm -rf /var/lib/apt/lists/*",
     )
-    .add_local_dir("pkg", "/app", copy=True)
+    .add_local_file("package.json", "/app/package.json", copy=True)
     .add_local_file("pnpm-lock.yaml", "/app/pnpm-lock.yaml", copy=True)
-    .add_local_file(".npmrc", "/app/.npmrc", copy=True)
+    .add_local_dir("pkg", "/app", copy=True)
     .run_commands(
-        # Install runtime deps into the already-derived package artifact.
+        # Runtime image consumes the same Bazel-derived artifact that npm publishes.
         "cd /app && pnpm install --prod --frozen-lockfile --ignore-scripts",
         "ls -la /app/dist/server/handler.js",
     )

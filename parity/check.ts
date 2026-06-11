@@ -1,8 +1,14 @@
 // parity/check.ts
 import { createHash, createHmac } from 'node:crypto';
 
-export interface Slot { start_iso: string }
-export interface SlotsResponse { service_id: string; slots: Slot[] }
+export interface Slot {
+  readonly datetime?: string;
+  readonly start_iso?: string;
+  readonly startIso?: string;
+  readonly available?: boolean;
+}
+export interface SlotsResponse { serviceId: string; slots: Slot[] }
+interface BridgeSuccessResponse<T> { success: true; data: T }
 export type DiffLevel = 'OK' | 'WARN' | 'CRITICAL';
 
 export interface DiffResult {
@@ -28,9 +34,41 @@ const sign = (secret: string, path: string, ts: string, body?: string): string =
   return createHmac('sha256', secret).update(`${ts}${path}${bodyHash}`).digest('hex');
 };
 
+const slotKey = (slot: Slot): string =>
+  slot.datetime ?? slot.start_iso ?? slot.startIso ?? JSON.stringify(slot);
+
+const availableSlotKeys = (response: SlotsResponse): string[] =>
+  response.slots.filter(slot => slot.available !== false).map(slotKey);
+
+const unwrapSlotsResponse = (payload: unknown, serviceId: string): SlotsResponse => {
+  if (
+    payload &&
+    typeof payload === 'object' &&
+    'success' in payload &&
+    (payload as { success: unknown }).success === true &&
+    Array.isArray((payload as BridgeSuccessResponse<unknown[]>).data)
+  ) {
+    return { serviceId, slots: (payload as BridgeSuccessResponse<Slot[]>).data };
+  }
+
+  if (
+    payload &&
+    typeof payload === 'object' &&
+    Array.isArray((payload as { slots?: unknown }).slots)
+  ) {
+    const response = payload as { serviceId?: string; service_id?: string; slots: Slot[] };
+    return {
+      serviceId: response.serviceId ?? response.service_id ?? serviceId,
+      slots: response.slots,
+    };
+  }
+
+  throw new Error('Unexpected /availability/slots response shape');
+};
+
 export const classifyDiff = (modal: SlotsResponse, k8s: SlotsResponse): { level: DiffLevel; detail: string } => {
-  const modalSet = new Set(modal.slots.map(s => s.start_iso));
-  const k8sSet = new Set(k8s.slots.map(s => s.start_iso));
+  const modalSet = new Set(availableSlotKeys(modal));
+  const k8sSet = new Set(availableSlotKeys(k8s));
   const onlyModal = [...modalSet].filter(s => !k8sSet.has(s));
   const onlyK8s = [...k8sSet].filter(s => !modalSet.has(s));
   const drift = onlyModal.length + onlyK8s.length;
@@ -86,16 +124,22 @@ export const runParityCheck = async (cfg: ParityConfig): Promise<DiffResult[]> =
       date.setDate(date.getDate() + d);
       const iso = date.toISOString().slice(0, 10);
       const path = `/availability/slots`;
-      const body = { service_id: sid, date: iso };
+      const body = { serviceId: sid, date: iso };
       try {
-        const modal = (await fetchWithHmac(cfg.modalUrl, path, cfg.hmacSecret, cfg.bearerToken, body)) as SlotsResponse;
-        const k8s = (await fetchWithHmac(cfg.k8sUrl, path, cfg.hmacSecret, cfg.bearerToken, body)) as SlotsResponse;
+        const modal = unwrapSlotsResponse(
+          await fetchWithHmac(cfg.modalUrl, path, cfg.hmacSecret, cfg.bearerToken, body),
+          sid,
+        );
+        const k8s = unwrapSlotsResponse(
+          await fetchWithHmac(cfg.k8sUrl, path, cfg.hmacSecret, cfg.bearerToken, body),
+          sid,
+        );
         const { level, detail } = classifyDiff(modal, k8s);
         results.push({
           service: sid,
           date: iso,
-          modalCount: modal.slots.length,
-          k8sCount: k8s.slots.length,
+          modalCount: availableSlotKeys(modal).length,
+          k8sCount: availableSlotKeys(k8s).length,
           level,
           detail,
         });

@@ -21,7 +21,7 @@ import { SelectorError } from './errors.js';
  * Uses Emotion CSS-in-JS (css-* hashes are UNSTABLE — prefer semantic classes)
  *
  * Wizard flow:
- *   1. Service page: massageithaca.as.me → <li.select-item> list with "Book" buttons
+ *   1. Service page: <tenant>.as.me → <li.select-item> list with "Book" buttons
  *   2. Calendar page: /schedule/<hash>/appointment/<aptId>/calendar/<calId>
  *      - react-calendar month grid + available-times-container
  *   3. Client form: (after selecting time slot) → input fields

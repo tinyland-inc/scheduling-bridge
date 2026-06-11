@@ -12,10 +12,10 @@ import {
 // ---------------------------------------------------------------------------
 describe('classifyDiff for /availability/slots', () => {
   const modal: SlotsResponse = {
-    service_id: 's1',
+    serviceId: 's1',
     slots: [
-      { start_iso: '2026-05-01T10:00:00Z' },
-      { start_iso: '2026-05-01T11:00:00Z' },
+      { datetime: '2026-05-01T10:00:00Z', available: true },
+      { datetime: '2026-05-01T11:00:00Z', available: true },
     ],
   };
 
@@ -26,16 +26,17 @@ describe('classifyDiff for /availability/slots', () => {
   it('OK for ≤ 2 slot drift', () => {
     const k8s: SlotsResponse = {
       ...modal,
-      slots: [...modal.slots, { start_iso: '2026-05-01T12:00:00Z' }],
+      slots: [...modal.slots, { datetime: '2026-05-01T12:00:00Z', available: true }],
     };
     expect(classifyDiff(modal, k8s).level).toBe('OK');
   });
 
   it('WARN for 3–5 slot drift', () => {
     const k8s: SlotsResponse = {
-      service_id: 's1',
+      serviceId: 's1',
       slots: ['10', '11', '12', '13', '14'].map(h => ({
-        start_iso: `2026-05-01T${h}:00:00Z`,
+        datetime: `2026-05-01T${h}:00:00Z`,
+        available: true,
       })),
     };
     expect(classifyDiff(modal, k8s).level).toBe('WARN');
@@ -43,12 +44,22 @@ describe('classifyDiff for /availability/slots', () => {
 
   it('CRITICAL for > 5 slot drift', () => {
     const k8s: SlotsResponse = {
-      service_id: 's1',
+      serviceId: 's1',
       slots: Array.from({ length: 10 }, (_, i) => ({
-        start_iso: `2026-05-01T${String(i + 10).padStart(2, '0')}:00:00Z`,
+        datetime: `2026-05-01T${String(i + 10).padStart(2, '0')}:00:00Z`,
+        available: true,
       })),
     };
     expect(classifyDiff(modal, k8s).level).toBe('CRITICAL');
+  });
+
+  it('ignores unavailable slots when classifying drift', () => {
+    const k8s: SlotsResponse = {
+      ...modal,
+      slots: [...modal.slots, { datetime: '2026-05-01T12:00:00Z', available: false }],
+    };
+    expect(classifyDiff(modal, k8s).level).toBe('OK');
+    expect(classifyDiff(modal, k8s).detail).toBe('drift=0');
   });
 });
 
@@ -58,7 +69,7 @@ describe('classifyDiff for /availability/slots', () => {
 describe('fetchWithHmac signature shape', () => {
   const SECRET = 'test-secret-abc';
   const BASE = 'https://modal.example.internal';
-  const PATH = '/availability/slots?service=99&date=2026-05-01';
+  const PATH = '/availability/services?scope=smoke';
   const BEARER = 'my-bearer-token';
 
   let capturedRequest: Request | undefined;
@@ -68,7 +79,7 @@ describe('fetchWithHmac signature shape', () => {
     restoreFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       capturedRequest = new Request(input, init);
-      return new Response(JSON.stringify({ service_id: '99', slots: [] }), {
+      return new Response(JSON.stringify({ success: true, data: [] }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -107,7 +118,7 @@ describe('fetchWithHmac signature shape', () => {
   });
 
   it('sends POST with Content-Type JSON and stringified body when body provided', async () => {
-    const body = { service_id: '99', date: '2026-05-01' };
+    const body = { serviceId: '99', date: '2026-05-01' };
     await fetchWithHmac(BASE, '/availability/slots', SECRET, undefined, body);
 
     expect(capturedRequest!.method).toBe('POST');
@@ -141,7 +152,7 @@ describe('fetchWithHmac signature shape', () => {
       // Call 1: no body (GET)
       await fetchWithHmac(BASE, '/availability/slots', SECRET);
       // Call 2: with body (POST)
-      await fetchWithHmac(BASE, '/availability/slots', SECRET, undefined, { service_id: '99', date: '2026-05-01' });
+      await fetchWithHmac(BASE, '/availability/slots', SECRET, undefined, { serviceId: '99', date: '2026-05-01' });
       // Call 3: with explicit empty-string-equivalent body — JSON.stringify('') === '""', so this MUST differ from Call 1.
       // To verify the "empty body vs no body" equivalence, we pass an empty object and compare against no body separately.
 
@@ -166,8 +177,8 @@ describe('fetchWithHmac signature shape', () => {
 // ---------------------------------------------------------------------------
 describe('runParityCheck', () => {
   const makeSlotPayload = (slots: string[]): SlotsResponse => ({
-    service_id: 'svc1',
-    slots: slots.map(s => ({ start_iso: s })),
+    serviceId: 'svc1',
+    slots: slots.map(s => ({ datetime: s, available: true })),
   });
 
   const happyPayload = makeSlotPayload([
@@ -187,7 +198,7 @@ describe('runParityCheck', () => {
 
   it('happy path: identical payloads → classification OK with all structured fields', async () => {
     globalThis.fetch = vi.fn(async () =>
-      new Response(JSON.stringify(happyPayload), {
+      new Response(JSON.stringify({ success: true, data: happyPayload.slots }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       }),
@@ -219,7 +230,7 @@ describe('runParityCheck', () => {
       if (url.startsWith('https://k8s.internal')) {
         throw new Error('connection refused');
       }
-      return new Response(JSON.stringify(happyPayload), {
+      return new Response(JSON.stringify({ success: true, data: happyPayload.slots }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });

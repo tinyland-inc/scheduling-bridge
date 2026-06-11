@@ -1,17 +1,17 @@
 {
   "name": "@tummycrypt/scheduling-bridge",
-  "version": "0.4.2",
+  "version": "0.5.13",
   "description": "Backend-agnostic scheduling adapter hub with Playwright automation",
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "license": "MIT",
-  "homepage": "https://github.com/Jesssullivan/acuity-middleware",
+  "homepage": "https://github.com/Jesssullivan/scheduling-bridge",
   "bugs": {
-    "url": "https://github.com/Jesssullivan/acuity-middleware/issues"
+    "url": "https://github.com/Jesssullivan/scheduling-bridge/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Jesssullivan/acuity-middleware.git"
+    "url": "git+https://github.com/Jesssullivan/scheduling-bridge.git"
   },
   "exports": {
     ".": {
@@ -32,15 +32,17 @@
   ],
   "scripts": {
     "build": "node scripts/build-derived-artifacts.mjs",
-    "prepublishOnly": "pnpm check:release-metadata && pnpm build && pnpm check:package",
+    "prepublishOnly": "pnpm check:release-metadata && pnpm check:artifact-authority && pnpm build && pnpm check:package",
     "start": "node dist/server/handler.js",
     "dev": "tsx src/server/handler.ts",
+    "test:host": "vitest run --reporter=verbose --config vitest.config.ts",
     "test": "node scripts/run-bazel-target.mjs test //:test",
     "typecheck": "node scripts/run-bazel-target.mjs build //:typecheck",
     "docs:generate": "node scripts/generate-doc-surfaces.mjs",
     "docs:build": "pnpm docs:generate && mkdocs build --strict",
     "docs:serve": "pnpm docs:generate && mkdocs serve",
-    "docs:check": "pnpm docs:generate && mkdocs build --strict",
+    "docs:check": "node scripts/generate-doc-surfaces.mjs --check",
+    "check:artifact-authority": "node scripts/check-artifact-authority.mjs",
     "check:release-metadata": "node scripts/check-release-metadata.mjs",
     "check:package": "node scripts/check-package-surface.mjs",
     "clean": "rm -rf dist pkg",
@@ -48,14 +50,16 @@
     "paper:dev": "node docs/paper/watch.mjs"
   },
   "dependencies": {
-    "@tummycrypt/scheduling-kit": "^0.7.2",
+    "@tummycrypt/scheduling-kit": "^0.8.0",
     "effect": "^3.19.14",
     "ioredis": "^5",
+    "pg": "8.20.0",
     "playwright-core": "1.58.1",
     "prom-client": "^15"
   },
   "devDependencies": {
-    "@types/node": "^24.1.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "8.11.6",
     "ioredis-mock": "^8.13.1",
     "publint": "^0.3.18",
     "tsx": "^4.0.0",
@@ -74,6 +78,6 @@
     }
   },
   "engines": {
-    "node": ">=24 <26"
+    "node": "^22.0.0 || ^24.0.0"
   }
 }

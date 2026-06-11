@@ -1,40 +1,22 @@
 site_name: scheduling-bridge
-site_description: Runtime, packaging, and release docs for @tummycrypt/scheduling-bridge
-repo_url: https://github.com/Jesssullivan/acuity-middleware
-repo_name: Jesssullivan/acuity-middleware
-docs_dir: docs
-
+site_description: Remote Acuity scheduling bridge and package authority docs
+repo_url: https://github.com/Jesssullivan/scheduling-bridge
 theme:
   name: material
   features:
-    - navigation.instant
     - navigation.sections
-    - content.code.copy
-  palette:
-    - scheme: default
-      primary: teal
-      accent: amber
-
-plugins:
-  - search
-
+    - navigation.indexes
 markdown_extensions:
   - admonition
-  - attr_list
-  - def_list
-  - tables
-  - toc:
-      permalink: true
-  - pymdownx.inlinehilite
   - pymdownx.superfences
-
+  - pymdownx.snippets
 nav:
-  - Overview: index.md
+  - Home: index.md
   - Architecture: architecture.md
   - Runtime Contract: runtime-contract.md
-  - Build and Release: build-and-release.md
+  - Build And Release: build-and-release.md
   - Consumers: consumers.md
-  - Generated Repo Facts: generated/repo-facts.md
+  - Generated Facts: generated/repo-facts.md
   - Paper: paper.md
   - Paper Workspace: paper/README.md
   - Phase 1 Data: paper/data/phase1/README.md

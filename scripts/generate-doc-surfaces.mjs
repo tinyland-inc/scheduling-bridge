@@ -1,15 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
+const checkMode = process.argv.includes('--check');
 
 const read = (relativePath) =>
   readFileSync(new URL(relativePath, root), 'utf8');
-
-const write = (relativePath, content) => {
-  const url = new URL(relativePath, root);
-  mkdirSync(new URL('.', url), { recursive: true });
-  writeFileSync(url, content);
-};
 
 const extract = (source, pattern, label) => {
   const match = source.match(pattern);
@@ -186,6 +182,14 @@ This page is generated from \`package.json\`, \`MODULE.bazel\`, \`BUILD.bazel\`,
 - CI build command: \`${ciBuildCommand}\`
 - runtime start command: \`${pkg.scripts.start}\`
 
+## Runtime Provider Truth
+
+- provider-agnostic contract: Node HTTP server plus \`/health\` tuple
+- accepted next-production provider: K8s/container runtime from infrastructure
+- legacy proofing provider: Modal, automatic deploys disabled during TIN-981
+- forward consumer env names: \`SCHEDULING_BRIDGE_URL\` and
+  \`SCHEDULING_BRIDGE_AUTH_TOKEN\`
+
 ## Exported Entry Points
 
 | Export | Types | Runtime |
@@ -224,6 +228,10 @@ const llms = [
   '- `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`',
   `- CI and publish extract \`${ciPackageDir}\` / \`${publishPackageDir}\``,
   `- runtime start command is \`${pkg.scripts.start}\``,
+  '- provider-agnostic runtime contract is the Node HTTP server plus `/health` tuple',
+  '- K8s/container execution is the accepted next-production provider from infrastructure',
+  '- Modal is legacy proofing context with automatic deploys disabled during TIN-981',
+  '- consumer apps should use `SCHEDULING_BRIDGE_URL` and `SCHEDULING_BRIDGE_AUTH_TOKEN`',
   '',
   'Toolchains:',
   `- Bazelisk: \`${bazelVersion}\``,
@@ -271,5 +279,39 @@ const llms = [
   '- `docs/generated/repo-facts.md`',
 ].join('\n');
 
-write('docs/generated/repo-facts.md', `${repoFacts}\n`);
-write('llms.txt', `${llms}\n`);
+const outputs = new Map([
+  ['docs/generated/repo-facts.md', `${repoFacts}\n`],
+  ['llms.txt', `${llms}\n`],
+]);
+
+let hadChanges = false;
+
+for (const [relativePath, content] of outputs) {
+  const url = new URL(relativePath, root);
+  mkdirSync(new URL('.', url), { recursive: true });
+
+  let currentContent = null;
+  try {
+    currentContent = read(relativePath);
+  } catch {
+    currentContent = null;
+  }
+
+  if (currentContent === content) {
+    continue;
+  }
+
+  hadChanges = true;
+
+  if (checkMode) {
+    console.error(`Generated artifact is out of date: ${fileURLToPath(url)}`);
+    continue;
+  }
+
+  writeFileSync(url, content);
+  console.log(`updated ${relativePath}`);
+}
+
+if (checkMode && hadChanges) {
+  process.exit(1);
+}

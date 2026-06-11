@@ -7,6 +7,7 @@ export default defineConfig({
 			'src/**/__tests__/**/*.test.ts',
 			'tests/**/*.test.ts',
 			'parity/**/*.test.ts',
+			'bench/**/*.test.ts',
 		],
 		environment: 'node',
 		globals: true,

@@ -403,18 +403,18 @@ export const createWizardAdapter = (config: WizardAdapterConfig): SchedulingAdap
 		},
 
 		// -----------------------------------------------------------------------
-		// Reservation - not supported (pipeline has graceful fallback)
+		// Advisory soft hold - not supported (pipeline has graceful fallback)
 		// -----------------------------------------------------------------------
 
-		createReservation: () =>
+		softHoldSlot: () =>
 			Effect.fail(
 				Errors.reservation(
 					'BLOCK_FAILED',
-					'Reservations not supported by wizard adapter',
+					'Advisory soft holds are not supported by wizard adapter',
 				),
 			),
 
-		releaseReservation: () => Effect.succeed(undefined),
+		releaseSoftHold: () => Effect.succeed(undefined),
 
 		// -----------------------------------------------------------------------
 		// Write operations - Effect TS middleware

@@ -6,8 +6,10 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         python = pkgs.python312.override {
@@ -20,12 +22,13 @@
         bazel = pkgs.writeShellScriptBin "bazel" ''
           exec ${pkgs.bazelisk}/bin/bazelisk "$@"
         '';
-        docsPython = python.withPackages (ps:
-          with ps; [
+        docsPython = python.withPackages (
+          ps: with ps; [
             mkdocs
             mkdocs-material
             pymdown-extensions
-          ]);
+          ]
+        );
       in
       {
         formatter = pkgs.nixfmt-rfc-style;

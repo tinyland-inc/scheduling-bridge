@@ -1,25 +1,25 @@
 # scheduling-bridge
 
-`@tummycrypt/scheduling-bridge` is the remote automation layer for Acuity-backed scheduling.
-It owns Playwright automation, Effect-based browser/page lifecycle management, and the remote
-HTTP bridge that downstream apps use for services, availability, slots, booking, and health.
+`scheduling-bridge` is the remote Acuity automation service published as
+`@tummycrypt/scheduling-bridge`.
 
-## Start Here
+The repo owns browser automation, HTTP bridge endpoints, Docker and
+K8s/container runtime packaging, and the bridge runtime truth exposed by
+`/health`.
 
-- Use `direnv allow` or `nix develop` to enter the repo-managed shell.
-- Run `pnpm install --frozen-lockfile` once per checkout.
-- Run `pnpm docs:generate` before editing repo-facing docs.
-- Treat `bazel build //:pkg` as publish artifact truth.
-- Treat `pnpm build` as the local derivation step that syncs Bazel output into `pkg/` and `dist/`.
-- Keep `docs/paper.md` and `docs/paper/` aligned when runtime, deployment, or build claims change.
+It does not own app deployment, business-specific UI, or reusable
+backend-agnostic checkout components. It also does not own cluster state or
+public-edge routing. Those are consumer app, infrastructure, and
+`scheduling-kit` responsibilities.
 
-## Repo Truth
+## Authority Summary
 
-- Runtime owner: this repo
-- Package name: `@tummycrypt/scheduling-bridge`
-- Canonical publish artifact: `bazel-bin/pkg`
-- Stable runtime truth surface: `GET /health`
-- Current primary deployment target: Modal
-
-The generated facts page at [`docs/generated/repo-facts.md`](generated/repo-facts.md)
-is the compact machine-readable summary of package, toolchain, CI, and protocol metadata.
+- Bazel `//:pkg` builds the publishable package artifact.
+- `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`.
+- CI and publish workflows extract `./bazel-bin/pkg`.
+- Docker and K8s/container runtimes consume the materialized `pkg/` artifact
+  rather than rebuilding from source inside runtime images.
+- K8s/container execution is the accepted next-production bridge route; Modal
+  is legacy proofing context with automatic deploys disabled while TIN-981
+  closes the surface.
+- Generated facts live in `docs/generated/repo-facts.md`.

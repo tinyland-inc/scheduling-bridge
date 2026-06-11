@@ -15,7 +15,7 @@ export type RedisStatus = 'ok' | 'unreachable';
 export type BrowserStatus = 'ok' | 'unavailable' | 'timeout';
 
 export type CatalogResult =
-	| { status: 'ok'; size: number; source: 'l1' | 'l2' }
+	| { status: 'ok'; size: number; source: 'l1' | 'l2' | 'warmup' }
 	| { status: 'empty' }
 	| { status: 'error'; error: string };
 
@@ -34,8 +34,12 @@ export interface ReadyDeps {
 	catalogL1Count: () => number;
 	/** Check if the catalog key exists in L2 Redis (1 = yes, 0/null = no/error). */
 	catalogL2Exists: (() => Promise<number | null>) | null;
+	/** Populate the catalog when readiness sees a cold empty cache. Returns the warmed service count. */
+	catalogWarm?: () => Promise<number>;
 	/** Timeout in ms for the browser probe (default: 2000). */
 	browserTimeoutMs?: number;
+	/** Timeout in ms for the optional catalog warmup (default: 3000). */
+	catalogWarmTimeoutMs?: number;
 }
 
 // =============================================================================
@@ -43,6 +47,7 @@ export interface ReadyDeps {
 // =============================================================================
 
 const BROWSER_DEFAULT_TIMEOUT_MS = 2000;
+const CATALOG_WARM_DEFAULT_TIMEOUT_MS = 3000;
 
 const probeRedis = async (redisPing: (() => Promise<string>) | null): Promise<RedisStatus> => {
 	if (!redisPing) return 'ok';
@@ -94,6 +99,49 @@ const probeCatalog = async (
 	}
 };
 
+const withTimeout = async <A>(
+	fn: () => Promise<A>,
+	timeoutMs: number,
+	onTimeout: () => A,
+): Promise<A> => {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			fn(),
+			new Promise<A>((resolve) => {
+				timeout = setTimeout(() => resolve(onTimeout()), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timeout) clearTimeout(timeout);
+	}
+};
+
+const probeCatalogWarm = async (
+	catalogWarm: () => Promise<number>,
+	timeoutMs: number,
+): Promise<CatalogResult> => {
+	try {
+		const warmedCount = await withTimeout(
+			catalogWarm,
+			timeoutMs,
+			() => Number.NaN,
+		);
+
+		if (!Number.isFinite(warmedCount)) {
+			return { status: 'error', error: 'catalog warmup timed out' };
+		}
+
+		if (warmedCount > 0) {
+			return { status: 'ok', size: warmedCount, source: 'warmup' };
+		}
+
+		return { status: 'empty' };
+	} catch (e) {
+		return { status: 'error', error: e instanceof Error ? e.message : String(e) };
+	}
+};
+
 // =============================================================================
 // READINESS CHECK
 // =============================================================================
@@ -104,12 +152,27 @@ const probeCatalog = async (
  */
 export const runReadyChecks = async (deps: ReadyDeps): Promise<ReadyChecks> => {
 	const timeoutMs = deps.browserTimeoutMs ?? BROWSER_DEFAULT_TIMEOUT_MS;
+	const catalogWarmTimeoutMs =
+		deps.catalogWarmTimeoutMs ?? CATALOG_WARM_DEFAULT_TIMEOUT_MS;
 
 	const [redis, browser, catalog] = await Promise.all([
 		probeRedis(deps.redisPing),
 		probeBrowser(deps.browserConnected, timeoutMs),
 		probeCatalog(deps.catalogL1Count, deps.catalogL2Exists),
 	]);
+
+	if (
+		redis === 'ok' &&
+		browser === 'ok' &&
+		catalog.status === 'empty' &&
+		deps.catalogWarm
+	) {
+		return {
+			redis,
+			browser,
+			catalog: await probeCatalogWarm(deps.catalogWarm, catalogWarmTimeoutMs),
+		};
+	}
 
 	return { redis, browser, catalog };
 };

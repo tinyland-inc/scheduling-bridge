@@ -3,6 +3,8 @@
 # =============================================================================
 
 common --enable_bzlmod
+common --registry=https://raw.githubusercontent.com/tinyland-inc/bazel-registry/main
+common --registry=https://bcr.bazel.build
 
 # Build performance
 build --jobs=auto

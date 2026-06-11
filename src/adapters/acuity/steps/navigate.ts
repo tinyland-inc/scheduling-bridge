@@ -3,7 +3,7 @@
  *
  * Acuity's React SPA (2026) does NOT support deep-linking via query params.
  * Instead, we click through the 5-step wizard:
- *   1. Service page (massageithaca.as.me) → find service → click "Book"
+ *   1. Service page (<tenant>.as.me) → find service → click "Book"
  *   2. Calendar page → navigate to target month → click target day
  *   3. Time slots → click matching slot → "Select and continue"
  *   4. Land on client form (fields empty — filling is a separate step)
@@ -45,6 +45,15 @@ export interface NavigateResult {
 	readonly selectedDate: string;
 	readonly selectedTime: string;
 }
+
+export const normalizeServiceNameForMatch = (name: string): string =>
+	name.trim().replace(/\s+/g, ' ').toLowerCase();
+
+export const serviceNameMatches = (candidateName: string, requestedName: string): boolean => {
+	const candidate = normalizeServiceNameForMatch(candidateName);
+	const requested = normalizeServiceNameForMatch(requestedName);
+	return candidate.length > 0 && requested.length > 0 && candidate.includes(requested);
+};
 
 // =============================================================================
 // IMPLEMENTATION
@@ -150,7 +159,7 @@ const selectService = (
 				for (const item of items) {
 					const nameEl = await item.$(Selectors.serviceName[0]);
 					const name = await nameEl?.textContent();
-					if (name && name.trim().toLowerCase().includes(serviceName.toLowerCase())) {
+					if (name && serviceNameMatches(name, serviceName)) {
 						return item;
 					}
 				}

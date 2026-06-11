@@ -44,7 +44,7 @@ That advice is bad.
 
 Here is what I actually built:
 
-A 16-method `SchedulingAdapter` interface- services, providers, availability, reservations, bookings, clients- with every method returning `Effect<T, SchedulingError>` from Effect TS. Monadic composition all the way down. You cannot accidentally ignore an error because the type system won't let you access the success value without handling the error channel first.
+A 16-method `SchedulingAdapter` interface- services, providers, availability, advisory soft holds, bookings, clients- with every method returning `Effect<T, SchedulingError>` from Effect TS. Monadic composition all the way down. You cannot accidentally ignore an error because the type system won't let you access the success value without handling the error channel first.
 
 Then I implemented that interface twice.
 
@@ -179,7 +179,7 @@ I then wrote three targeted fix scripts to correct the specific wrong-priced app
 | Create booking     | ~30-60s (wizard)  | <200ms         | ~300x     |
 ```
 
-Two orders of magnitude. The browser path exists to maintain service continuity during migration. The homegrown adapter has full 16/16 method coverage. The wizard adapter has 12/16 (no `getBooking`, `cancelBooking`, or slot reservations through the public UI).
+Two orders of magnitude. The browser path exists to maintain service continuity during migration. The homegrown adapter has full 16/16 method coverage. The wizard adapter has 12/16 (no `getBooking`, `cancelBooking`, or advisory soft holds through the public UI).
 
 879 tests across the scheduling stack. 39 dedicated availability engine tests covering slot generation, DST transitions, overlap detection, buffer time, and the kind of edge cases that make you question whether `America/New_York` was a deliberate choice by the IANA or a cosmic prank.
 
@@ -207,14 +207,14 @@ Why pay for an API to rebuild a closed-source wizard when you *are* a wizard?
 |-------|-----------|---------|
 | Adapter interface | Effect TS | 16-method contract, monadic errors |
 | Browser middleware | Effect TS + Playwright | Wizard step programs, resource management |
-| Container runtime | Modal Labs | Serverless Chromium, warm pools |
+| Container runtime | Modal Labs (legacy), now self-hosted K8s (RKE2) | Headless Chromium, warm pools |
 | Selector registry | CSS fallback chains | DOM resilience against Emotion hash instability |
 | Homegrown backend | Drizzle ORM + Neon PG | Direct queries, sub-100ms |
 | Availability engine | Pure functions + Intl | DST-safe slot generation, 39 tests |
 | Feature flag | `SCHEDULING_BACKEND` env var | Strangler fig routing |
 | Payment bypass | Gift certificate coupon | Decouples scheduling from Square |
 
-Source: [Jesssullivan/acuity-middleware](https://github.com/Jesssullivan/acuity-middleware)
+Source: [Jesssullivan/scheduling-bridge](https://github.com/Jesssullivan/scheduling-bridge)
 
 ---
 

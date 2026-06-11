@@ -1,28 +1,17 @@
 # Consumers
 
-This page records the practical downstream usage found in the `2026-04-23` local audit.
+Current downstream consumers should depend on the published package:
 
-## Direct Runtime Consumer
+- npm package: `@tummycrypt/scheduling-bridge`
+- primary app consumer: `MassageIthaca`
+- reusable library peer: `@tummycrypt/scheduling-kit`
 
-`MassageIthaca` is the active package consumer.
+Do not vendor this repo into app repositories. App repos should treat the bridge
+as a package plus a deployed runtime endpoint. If an app needs Acuity DOM
+selectors, browser orchestration, Modal build behavior, or bridge health tuple
+interpretation, that belongs here first.
 
-Observed usage:
-
-- `createWizardAdapter` for local or remote Acuity scheduling
-- `createRemoteWizardAdapter` for cron-time catalog reconciliation
-- `extractCapabilities` as the canonical payment-capability extraction helper
-
-Observed package version:
-
-- `@tummycrypt/scheduling-bridge ^0.4.2`
-
-## Boundary Companion
-
-`scheduling-kit` is not the bridge runtime consumer, but it is the boundary companion package.
-It re-exports scheduling contracts and explicitly documents that browser automation belongs in
-`@tummycrypt/scheduling-bridge`.
-
-## Operational References
-
-`GloriousFlywheel` and adjacent infra repos reference this repo operationally for CI, runner,
-or packaging policy, but they are not runtime consumers of the published bridge package.
+Consumer app configuration should use provider-neutral bridge names such as
+`SCHEDULING_BRIDGE_URL` and `SCHEDULING_BRIDGE_AUTH_TOKEN`. `MODAL_*` names may
+remain as compatibility aliases during migration, but they should not be used as
+the forward app contract.

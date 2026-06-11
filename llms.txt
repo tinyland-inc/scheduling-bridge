@@ -11,6 +11,10 @@ Authority:
 - `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`
 - CI and publish extract `./bazel-bin/pkg` / `./bazel-bin/pkg`
 - runtime start command is `node dist/server/handler.js`
+- provider-agnostic runtime contract is the Node HTTP server plus `/health` tuple
+- K8s/container execution is the accepted next-production provider from infrastructure
+- Modal is legacy proofing context with automatic deploys disabled during TIN-981
+- consumer apps should use `SCHEDULING_BRIDGE_URL` and `SCHEDULING_BRIDGE_AUTH_TOKEN`
 
 Toolchains:
 - Bazelisk: `8.1.1`
@@ -18,12 +22,12 @@ Toolchains:
 - flake Node major: `24`
 - pnpm toolchain: `9.15.9`
 - package manager: `pnpm@9.15.9`
-- engines: `>=24 <26`
-- CI node matrix: `24, 25`
+- engines: `^22.0.0 || ^24.0.0`
+- CI node matrix: `22, 24`
 - CI publish node: `24`
 
 Protocol:
-- version: `1.0.0`
+- version: `1.2.0`
 - flow owner: `scheduling-bridge`
 - backend: `acuity`
 - transport: `http-json`
@@ -35,8 +39,15 @@ Endpoints:
 - `availabilityDates` -> `/availability/dates`
 - `availabilitySlots` -> `/availability/slots`
 - `availabilityCheck` -> `/availability/check`
+- `availabilityRefresh` -> `/availability/refresh`
+- `availabilitySnapshot` -> `/availability/snapshot`
+- `availabilityHeartbeat` -> `/internal/availability/heartbeat`
+- `availabilityReadiness` -> `/internal/availability/readiness`
+- `availabilityWaitReady` -> `/internal/availability/wait-ready`
 - `bookingCreate` -> `/booking/create`
 - `bookingCreateWithPayment` -> `/booking/create-with-payment`
+- `bookingJobs` -> `/booking/jobs`
+- `jobStatus` -> `/jobs/:operationId`
 
 Capabilities:
 - `services:list`
@@ -44,8 +55,15 @@ Capabilities:
 - `availability:dates`
 - `availability:slots`
 - `availability:check`
+- `availability:refresh-async`
+- `availability:snapshot`
+- `availability:heartbeat-internal`
+- `availability:readiness-internal`
+- `availability:wait-ready-internal`
 - `booking:create`
-- `booking:create-with-payment`
+- `booking:create-with-payment:deprecated`
+- `booking:create-with-payment-async`
+- `booking:job-status`
 - `service-catalog:static-fallback`
 - `service-catalog:business-extract`
 - `service-catalog:scraper-fallback`

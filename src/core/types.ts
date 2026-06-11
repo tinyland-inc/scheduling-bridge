@@ -24,7 +24,7 @@ export type {
   Booking,
   BookingStatus,
   PaymentStatus,
-  SlotReservation,
+  SlotSoftHold,
   PaymentIntent,
   PaymentResult,
   RefundResult,

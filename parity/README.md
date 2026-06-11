@@ -1,8 +1,8 @@
 # Modal ↔ K8s Parity Harness
 
 Shadow-traffic parity check for the Modal → K8s migration (phase 1.1 bake).
-Compares `/availability/slots` responses between the Modal (production) backend
-and the K8s (shadow) backend, classifies divergence into `OK` / `WARN` /
+Compares `/availability/slots` responses between the Modal-backed reference
+backend and the K8s-native backend, classifies divergence into `OK` / `WARN` /
 `CRITICAL` buckets, and emits one NDJSON record per (service, date) probe.
 
 The harness is intended to run from a tailnet-reachable host (cron or Ansible
@@ -13,9 +13,10 @@ shared secret the middleware uses for upstream auth.
 
 During phase 1.1 of the Modal → K8s migration, the K8s cluster serves *shadow*
 traffic only: real reads are replayed against it for correctness comparison
-while Modal stays authoritative. This harness drives that comparison on a
-fixed cadence (nightly or every 10 minutes during active bake) so divergence
-can be surfaced via Loki alerts long before any cutover.
+while Modal remains the reference path. K8s-native middleware execution is the
+target production route after parity bake passes. This harness drives that
+comparison on a fixed cadence (nightly or every 10 minutes during active bake)
+so divergence can be surfaced via Loki alerts long before any cutover.
 
 ## Environment variables
 
@@ -40,13 +41,34 @@ Every request to both backends sends **two** auth mechanisms:
    enforce them; they are included now so the infrastructure is in place before
    enforcement is added.
 
-The HMAC signature is `HMAC-SHA256(secret, timestamp + path)` where `timestamp`
-is the Unix epoch in milliseconds and `path` is the request path including query
-string (e.g., `/availability/slots?service=12345&date=2026-05-01`).
+The HMAC signature is `HMAC-SHA256(secret, timestamp + path + bodyHash)` where
+`timestamp` is the Unix epoch in milliseconds, `path` is the request path, and
+`bodyHash` is the SHA-256 hex digest of the raw JSON request body. Bodyless GETs
+use the SHA-256 digest of the empty string. The current slot probe posts to
+`/availability/slots` with a JSON body:
+
+```json
+{"serviceId":"12345","date":"2026-05-01"}
+```
 
 Both `MODAL_URL` and `K8S_URL` must be tailnet-reachable from the harness host.
 The harness never punches out to the public internet — it relies on the same
 private routing the middleware itself uses.
+
+## Slot Contract
+
+Current bridge responses wrap available slots in the standard success envelope:
+
+```json
+{"success":true,"data":[{"datetime":"2026-05-01T10:00:00Z","available":true}]}
+```
+
+The harness also accepts the legacy raw `{ "slots": [...] }` shape so old
+captures can still be replayed during investigation. Slot identity is taken
+from `datetime`, with `start_iso` and `startIso` tolerated for historical
+fixtures. Slots marked `"available": false` are ignored for drift counts.
+Disabled Acuity calendar dates are a valid zero-slot result and should not be
+reported as scrape failures.
 
 ## Exit codes
 
@@ -76,7 +98,7 @@ cadence to hourly or nightly before promoting K8s to receive real traffic.
 
 ## Diff thresholds
 
-The classifier bins the symmetric-difference count of `start_iso` timestamps:
+The classifier bins the symmetric-difference count of available slot timestamps:
 
 | Drift (slots) | Level      | Action                                                    |
 | ------------- | ---------- | --------------------------------------------------------- |

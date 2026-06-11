@@ -135,6 +135,54 @@ describe('runReadyChecks', () => {
 		expect(checks.catalog).toEqual({ status: 'empty' });
 	});
 
+	it('warms catalog when Redis and browser are ok but L1/L2 are empty', async () => {
+		let warmCalls = 0;
+		const deps: ReadyDeps = {
+			...happyDeps(),
+			catalogL1Count: () => 0,
+			catalogL2Exists: async () => 0,
+			catalogWarm: async () => {
+				warmCalls += 1;
+				return 10;
+			},
+		};
+		const checks = await runReadyChecks(deps);
+
+		expect(warmCalls).toBe(1);
+		expect(checks.catalog).toEqual({ status: 'ok', size: 10, source: 'warmup' });
+	});
+
+	it('does not warm catalog when Redis is unreachable', async () => {
+		let warmCalls = 0;
+		const deps: ReadyDeps = {
+			...happyDeps(),
+			redisPing: async () => { throw new Error('ECONNREFUSED'); },
+			catalogL1Count: () => 0,
+			catalogL2Exists: async () => 0,
+			catalogWarm: async () => {
+				warmCalls += 1;
+				return 10;
+			},
+		};
+		const checks = await runReadyChecks(deps);
+
+		expect(warmCalls).toBe(0);
+		expect(checks.redis).toBe('unreachable');
+		expect(checks.catalog).toEqual({ status: 'empty' });
+	});
+
+	it('returns catalog error when cold-start warmup fails', async () => {
+		const deps: ReadyDeps = {
+			...happyDeps(),
+			catalogL1Count: () => 0,
+			catalogL2Exists: async () => 0,
+			catalogWarm: async () => { throw new Error('acuity unavailable'); },
+		};
+		const checks = await runReadyChecks(deps);
+
+		expect(checks.catalog).toEqual({ status: 'error', error: 'acuity unavailable' });
+	});
+
 	it('returns catalog ok with source l2 when L1 is empty but L2 has data', async () => {
 		const deps: ReadyDeps = {
 			...happyDeps(),
@@ -290,6 +338,23 @@ describe('handleReady', () => {
 		expect(mock.status).toBe(503);
 		const body = mock.body() as { status: string; checks: ReadyChecks };
 		expect(body.checks.catalog).toEqual({ status: 'empty' });
+	});
+
+	it('returns 200 after catalog cold-start warmup succeeds', async () => {
+		const mock = makeRes();
+		const deps: ReadyDeps = {
+			...happyDeps(),
+			catalogL1Count: () => 0,
+			catalogL2Exists: async () => 0,
+			catalogWarm: async () => 10,
+		};
+
+		await handleReady(mock.raw, deps);
+
+		expect(mock.status).toBe(200);
+		const body = mock.body() as { status: string; checks: ReadyChecks };
+		expect(body.status).toBe('ready');
+		expect(body.checks.catalog).toEqual({ status: 'ok', size: 10, source: 'warmup' });
 	});
 
 	it('returns 200 with catalog.source: "l2" when L1 empty but L2 has data', async () => {

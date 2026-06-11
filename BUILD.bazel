@@ -1,9 +1,9 @@
 """
 BUILD.bazel for @tummycrypt/scheduling-bridge.
 
-Backend-agnostic scheduling adapter hub.
-  Repo operator surface: pnpm build     (materializes dist/ from Bazel //:pkg)
-  Artifact authority:    bazel build //:pkg
+Backend-agnostic scheduling adapter hub. Bazel owns the publishable artifact.
+  Local materialization: pnpm build
+  Bazel artifact:        bazel build //:pkg
 
 Architecture:
   //:core               - Re-exported types from scheduling-kit
@@ -16,8 +16,8 @@ Architecture:
 
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
-load("@npm//:defs.bzl", "npm_link_all_packages")
-load("@npm//:vitest/package_json.bzl", vitest_bin = "bin")
+load("@tummycrypt_scheduling_bridge_npm//:defs.bzl", "npm_link_all_packages")
+load("@tummycrypt_scheduling_bridge_npm//:vitest/package_json.bzl", vitest_bin = "bin")
 
 # =============================================================================
 # npm link
@@ -98,6 +98,7 @@ ts_project(
     name = "server",
     srcs = [
         "src/server/handler.ts",
+        "src/server/worker.ts",
         "src/server.ts",
     ],
     declaration = True,
@@ -110,6 +111,8 @@ ts_project(
         ":shared",
         ":node_modules",
         ":node_modules/effect",
+        ":node_modules/pg",
+        ":node_modules/@types/pg",
         ":node_modules/@tummycrypt/scheduling-kit",
     ],
     visibility = ["//visibility:public"],
@@ -138,6 +141,8 @@ ts_project(
         ":node_modules",
         ":node_modules/effect",
         ":node_modules/playwright-core",
+        ":node_modules/pg",
+        ":node_modules/@types/pg",
         ":node_modules/@tummycrypt/scheduling-kit",
     ],
     visibility = ["//visibility:public"],
@@ -157,7 +162,7 @@ npm_package(
     ],
     package = "@tummycrypt/scheduling-bridge",
     tags = ["manual"],
-    version = "0.4.2",
+    version = "0.5.13",
     visibility = ["//visibility:public"],
 )
 
@@ -173,7 +178,13 @@ vitest_bin.vitest_test(
         "tsconfig.json",
         ":node_modules/vitest",
         "vitest.config.ts",
-    ] + glob(["src/**/*.ts"]),
+    ] + glob([
+        "src/**/*.ts",
+        "tests/**/*.ts",
+        "parity/**/*.ts",
+        "bench/**/*.ts",
+        "bench/**/*.js",
+    ]),
     args = [
         "run",
         "--reporter=verbose",
@@ -200,6 +211,8 @@ ts_project(
         ":node_modules",
         ":node_modules/effect",
         ":node_modules/playwright-core",
+        ":node_modules/pg",
+        ":node_modules/@types/pg",
         ":node_modules/@tummycrypt/scheduling-kit",
     ],
     visibility = ["//visibility:public"],

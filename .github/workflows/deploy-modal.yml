@@ -1,26 +1,12 @@
 name: Deploy Modal
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'modal-app.py'
-      - 'src/**'
-      - 'scripts/**'
-      - 'package.json'
-      - 'pnpm-lock.yaml'
-      - '.npmrc'
-      - 'tsconfig.json'
-      - '.bazelrc'
-      - '.bazelversion'
-      - 'BUILD.bazel'
-      - 'MODULE.bazel'
-      - 'MODULE.bazel.lock'
-      - 'README.md'
-      - 'LICENSE'
-      - '.github/workflows/deploy-modal.yml'
   workflow_dispatch:
     inputs:
+      acknowledge_legacy_modal:
+        description: 'Type legacy-modal to acknowledge this path is decommissioning-only'
+        required: true
+        type: string
       modal_environment:
         description: 'Modal environment name (optional)'
         required: false
@@ -41,6 +27,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: ${{ github.event.inputs.acknowledge_legacy_modal == 'legacy-modal' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,9 +40,8 @@ jobs:
         with:
           node-version: '24'
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.9
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.9 --activate
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

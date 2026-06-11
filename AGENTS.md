@@ -1,6 +1,10 @@
 # scheduling-bridge Agent Notes
 
-This file is the working brief for AI agents and LLMs operating in the `acuity-middleware` repo, which publishes as `@tummycrypt/scheduling-bridge`.
+<!-- markdownlint-disable MD013 -->
+
+This file is the working brief for AI agents and LLMs operating in the
+`scheduling-bridge` repo, formerly `acuity-middleware`, which publishes as
+`@tummycrypt/scheduling-bridge`.
 
 ## Repo Role
 
@@ -12,7 +16,7 @@ It owns:
 - Playwright orchestration
 - Effect-based resource management around browser/page lifecycle
 - remote HTTP endpoints for services, availability, slots, booking, and health
-- Modal and Docker deployment surfaces
+- bridge runtime packaging for Modal, Docker, and Kubernetes/container targets
 
 It does **not** own:
 
@@ -20,6 +24,8 @@ It does **not** own:
 - application-specific environment switching
 - site-specific admin UI
 - reusable, backend-agnostic UI components
+- Kubernetes cluster state or public edge routing; those live in the
+  infrastructure repo
 
 ## Strategic Goal
 
@@ -33,38 +39,90 @@ That makes this repo central to the migration paper and to the operational beta-
 
 ## Current Tracking
 
-As of `2026-04-23`, the active tracker truth around this repo is:
+As of `2026-05-10`, the active structural work here is:
 
-- initiative: `Practitioner Kit Platform` is active
-- project: `Practitioner Kit Roadmap` is active
-- `TIN-101` was completed on `2026-04-20`
-- `TIN-104` was canceled as a duplicate on `2026-04-19`
-- active repo-adjacent work clusters around `TIN-89`, `TIN-165`, `TIN-189`,
-  and GitHub issues `#43`, `#44`, `#47`, and `#10`
+- `TIN-89` package, Bazel, CI, publish, and dependency truth across shared
+  scheduling packages
+- `TIN-165` bazel-registry generation from standalone package truth
+- `TIN-189` Modal-to-K8s bridge migration and parity bake
+- release, tag, and npm authority cleanup tracked in GitHub issue `#76`
+- runtime/provider decoupling tracked in GitHub issue `#44`
+- runner reachability and shared-runner adoption, still pending proof before it
+  becomes this public repo's live workflow contract
 
 Operationally relevant truth:
 
-- the current published bridge line is `0.4.2`
-- the bridge dependency is `@tummycrypt/scheduling-kit ^0.7.2`
-- `MassageIthaca` currently consumes `@tummycrypt/scheduling-bridge ^0.4.2`
+- the published npm line is `@tummycrypt/scheduling-bridge` `0.5.11`; repo
+  package metadata on `main` is `0.5.13` (publish pending)
+- the `0.5.x` line depends on `@tummycrypt/scheduling-kit ^0.8.0`
+- production runs the `main` container image `ghcr` `sha-1de594e` on K8s since
+  `2026-05-14`
+- the `0.5.x` line is the async bridge redesign lane: async booking jobs,
+  availability snapshots, Redis/Postgres async stores, and request-path
+  availability prewarm enqueueing
+- package metadata, git tags, npm dist-tags, GitHub releases, and deployed
+  bridge runtime tuples remain separate authority surfaces and should be
+  verified explicitly
 
 ## Deployment Truth
 
+### Runtime Contract
+
+The provider-agnostic bridge contract is the Node HTTP server plus `/health`
+runtime tuple. Consumers should talk about this service as the scheduling
+bridge, not as "Modal", unless they are discussing the Modal deployment itself.
+
+Current provider truth:
+
+- K8s/container execution is the accepted next-production bridge route and is
+  the current K8s shadow runtime for MassageIthaca scheduling-bridge traffic.
+- Modal remains legacy proofing context only. The forward production path is
+  K8s-native bridge execution; do not re-enable automatic Modal deploys without
+  reopening the provider-spend/runtime decision.
+- Cluster state, tailnet exposure, and public-edge routing are infrastructure
+  concerns outside this repo.
+- Docker/container execution must mirror the same built Node entrypoint so K8s
+  and other providers do not become separate runtime implementations.
+- Downstream apps should configure bridge endpoints with
+  `SCHEDULING_BRIDGE_URL` / `SCHEDULING_BRIDGE_AUTH_TOKEN`; legacy `MODAL_*`
+  names are compatibility aliases outside this repo, not the forward contract.
+
 ### Modal
 
-Modal is the primary remote deployment surface.
+Modal is the legacy proofing/fallback remote deployment surface.
 
 Important facts:
 
 - the deployed server should run `dist/server/handler.js`
 - the Modal image must stay aligned with the same built artifact used by `pnpm start`
 - warm-container behavior and concurrency settings are part of the real latency story
+- Modal-specific docs and workflows are retained until fallback/live-beta
+  traffic is retired deliberately
 
-### Docker
+### Docker / K8s Container
 
-Docker should mirror the same entrypoint and runtime assumptions as Modal.
+Docker and K8s containers should mirror the same `dist/server/handler.js`
+entrypoint and runtime assumptions as every other provider.
 
-If Modal and Docker drift from the actual Node entrypoint, that is an operational bug.
+If Modal, Docker, and K8s drift from the actual Node entrypoint, that is an
+operational bug.
+
+K8s async runtime truth:
+
+- `BRIDGE_DATABASE_URL` is the strict durable async queue/snapshot store when
+  Postgres is configured.
+- `REDIS_URL` is also a valid K8s async store when Postgres is absent; it backs
+  both the read cache and the Redis job/snapshot store.
+- `BRIDGE_INLINE_WORKER_ENABLED` defaults on when Postgres or Redis is
+  configured, so a single HTTP deployment can drain queued jobs until a
+  separate worker deployment exists.
+- request-path date/slot prewarm must enqueue async refresh jobs; browser
+  scraping for prewarm is worker-owned, not request-owned.
+- cutover claims for queue/cache readiness should use the auth-gated
+  `/internal/availability/readiness` or `/internal/availability/wait-ready`
+  endpoints. The former is read-only; the latter may run heartbeat/requeue once
+  and then poll readiness, but neither endpoint may run Acuity browser
+  automation directly on the HTTP request path.
 
 ### Release Coordination
 
@@ -135,15 +193,10 @@ If beta feels slow, do not dismiss that as “just Playwright.” Measure the st
 Important commands:
 
 ```bash
-pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm test
 pnpm build
 pnpm docs:generate
-pnpm docs:build
-bazel build //:pkg
-bazel build //:typecheck
-bazel test //:test
 ```
 
 Current publish flow targets:
@@ -151,33 +204,31 @@ Current publish flow targets:
 - npm as `@tummycrypt/scheduling-bridge`
 - GitHub Packages as `@jesssullivan/scheduling-bridge`
 
-The repo name is still `acuity-middleware`, but the package name is `scheduling-bridge`. Preserve that distinction.
+The canonical GitHub repo is `Jesssullivan/scheduling-bridge`; historical
+`Jesssullivan/acuity-middleware` URLs may redirect. The npm package name is
+`@tummycrypt/scheduling-bridge`. Preserve that distinction.
 
-Today the repo is derivation-first, not pnpm-first:
+Current CI and publish workflows use the shared `js-bazel-package` workflow with:
 
-- Bazel `//:pkg` is the publishable artifact authority
-- `pnpm build` materializes local `pkg/` and `dist/` from `bazel-bin/pkg`
-- Docker and Modal should consume the derived local `pkg/` package instead of
-  compiling source again inside the runtime image
-- `pnpm typecheck` and `pnpm test` delegate to Bazel targets instead of
-  maintaining parallel TypeScript or Vitest authority
-- CI/publish extract and publish `./bazel-bin/pkg`
-- CI `build_command` is only an artifact-authority contract check; Bazel
-  target validation and package-surface validation own the actual package build
-- the repo-local dev shell should provide Bazelisk, Node 24 LTS, pnpm,
-  MkDocs, Tectonic, and Playwright browsers via `nix develop` / `direnv`
-- the declared consumer support window is Node `>=24 <26`; CI spans Node 24
-  and 25 while Bazel, Nix, Modal, and Docker anchor the canonical build lane
-  on Node 24 LTS
+- `runner_mode: shared`
+- `publish_mode: same_runner`
+- `bazel_targets: "//:pkg"`
+- `package_dir: ./bazel-bin/pkg`
 
-## Docs / LLM Surfaces
+That means Bazel-built package output is already part of the CI/publish path.
+Do not regress publish lanes back to ad hoc pnpm packaging without explicitly
+re-opening the package authority decision.
 
-- `llms.txt` and `docs/generated/repo-facts.md` are generated from
-  package/build/protocol metadata via `pnpm docs:generate`
-- `mkdocs.yml` plus `docs/**` is the operator-facing and LLM-friendly doc site
-  surface
-- do not hand-edit generated doc files; change the source metadata or the
-  generator instead
+<!-- markdownlint-enable MD013 -->
+
+Current runner truth:
+
+- the public workflow contract names the runner policy, not private runner
+  topology
+- the concrete shared-runner labels come from repository Actions variables and
+  must be proven by green workflow runs before being treated as operational truth
+- keep private runner topology, cluster names, and apply details out of this
+  public repo; track those in the private infrastructure repo and Linear
 
 ## Important Files
 
@@ -188,6 +239,15 @@ Today the repo is derivation-first, not pnpm-first:
 - `src/adapters/acuity/steps/**`
 - `modal-app.py`
 - `Dockerfile`
+- `MODULE.bazel`
+- `BUILD.bazel`
+- `flake.nix`
+- `mkdocs.yml`
+- `docs/generated/repo-facts.md`
+- `llms.txt`
+- `scripts/build-derived-artifacts.mjs`
+- `scripts/check-artifact-authority.mjs`
+- `scripts/check-release-metadata.mjs`
 - `.github/workflows/ci.yml`
 - `.github/workflows/publish.yml`
 
@@ -199,4 +259,3 @@ Today the repo is derivation-first, not pnpm-first:
 - Do not confuse this repo with the reusable UI/package layer.
 - Do not let the bridge package declare stale `scheduling-kit` dependencies
   while downstream apps have already moved on.
-- Do not let `pnpm build` out-rank Bazel `//:pkg`; `pnpm build` is a derivation surface, not a second build authority.

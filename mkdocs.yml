@@ -22,4 +22,5 @@ nav:
   - Consumers: consumers.md
   - Design:
       - Flow DAG Formalization (TIN-1993): design/flow-dag-formalization.md
+      - Trace-Conformance Parity Evidence (TIN-2072): design/parity-evidence.md
   - Generated Facts: generated/repo-facts.md

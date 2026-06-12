@@ -35,7 +35,7 @@ export class CacheTimeoutError extends Data.TaggedError('CacheTimeoutError')<{
 
 // ─── Service tag ─────────────────────────────────────────────────────────────
 
-export class RedisL2 extends Context.Tag('acuity-mw/RedisL2')<RedisL2, IORedis>() {}
+export class RedisL2 extends Context.Tag('scheduling-bridge/RedisL2')<RedisL2, IORedis>() {}
 
 // ─── Layer ───────────────────────────────────────────────────────────────────
 // `Layer.scoped` + `Effect.acquireRelease` ensures the ioredis connection's

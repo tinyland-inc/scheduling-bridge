@@ -16,6 +16,7 @@
  *   GET  /availability/snapshot     - Read latest availability snapshot
  *   GET  /internal/availability/snapshot-canary - Auth-gated durable snapshot proof
  *   POST /internal/availability/heartbeat - Auth-gated bounded refresh heartbeat
+ *   GET  /internal/flows            - Auth-gated registered FlowPlans (read-only)
  *   POST /booking/create            - Create booking (standard)
  *   POST /booking/create-with-payment - Deprecated sync paid booking endpoint
  *   POST /booking/jobs              - Enqueue async paid booking job
@@ -74,6 +75,7 @@ import {
 	readDatesViaUrl,
 	readSlotsViaUrl,
 } from '../adapters/acuity/steps/read-via-url.js';
+import { acuityFlowEnqueuePinning, acuityFlows } from '../adapters/acuity/flows.js';
 import { buildHealthPayload } from './health.js';
 import { handleReady as _handleReady } from './ready.js';
 import {
@@ -568,7 +570,7 @@ const enqueueAvailabilityPrewarmJob = (
 				};
 
 	void bridgeAsyncStore
-		.enqueueJob(job, { idempotencyKey })
+		.enqueueJob(job, { idempotencyKey, ...acuityFlowEnqueuePinning(job.kind) })
 		.then((record) => {
 			logRequestEvent('INFO', 'Availability prewarm job enqueued', context, {
 				event: 'availability_prewarm_job_enqueued',
@@ -1461,7 +1463,10 @@ const handleEnqueueBookingJob = async (
 			executionPreference: 'auto',
 		},
 	};
-	const record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
+	const record = await bridgeAsyncStore.enqueueJob(job, {
+		idempotencyKey,
+		...acuityFlowEnqueuePinning(job.kind),
+	});
 
 	logRequestEvent('INFO', 'Booking async job enqueued', context, {
 		event: 'booking_job_enqueued',
@@ -1557,7 +1562,10 @@ const handleEnqueueAvailabilityRefresh = async (
 					},
 				};
 
-	const record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
+	const record = await bridgeAsyncStore.enqueueJob(job, {
+		idempotencyKey,
+		...acuityFlowEnqueuePinning(job.kind),
+	});
 
 	logRequestEvent('INFO', 'Availability refresh job enqueued', context, {
 		event: 'availability_refresh_enqueued',
@@ -1660,7 +1668,10 @@ const runAvailabilityHeartbeat = async (
 			idempotencyBucket,
 		].join(':');
 		const enqueueStartedAt = Date.now();
-		let record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
+		let record = await bridgeAsyncStore.enqueueJob(job, {
+			idempotencyKey,
+			...acuityFlowEnqueuePinning(job.kind),
+		});
 		let action: AvailabilityHeartbeatJob['action'] =
 			Date.parse(record.createdAt) < enqueueStartedAt ? 'deduped' : 'queued';
 		if (isRetryableHeartbeatFailure(record)) {
@@ -2083,6 +2094,30 @@ const handleAvailabilitySnapshotCanary = async (
 	});
 };
 
+/**
+ * GET /internal/flows — serve all registered FlowPlans as JSON (design
+ * docs/design/flow-dag-formalization.md §5 "GET /internal/flows serves all
+ * registered plans, auth-gated like existing /internal/* routes"). Read-only and
+ * purely additive: plans are derived projections of the flow definitions
+ * (src/adapters/acuity/flows.ts), never authored or mutated through this surface.
+ */
+const handleInternalFlows = (res: ServerResponse) => {
+	if (!AUTH_TOKEN) {
+		return notFoundInternalEndpoint(res);
+	}
+	sendSuccess(res, {
+		layer: 'bridge_flow_plans',
+		backend: 'acuity',
+		flows: Object.values(acuityFlows).map((flow) => ({
+			flowId: flow.plan.flowId,
+			backend: flow.plan.backend,
+			version: flow.plan.version,
+			planHash: flow.planHash,
+			plan: flow.plan,
+		})),
+	});
+};
+
 // =============================================================================
 // SERVER
 // =============================================================================
@@ -2186,6 +2221,9 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/internal/availability/wait-ready' && method === 'POST') {
 			return await handleAvailabilityWaitReady(req, res, context);
+		}
+		if (path === '/internal/flows' && method === 'GET') {
+			return handleInternalFlows(res);
 		}
 		if (path.startsWith('/jobs/') && method === 'GET') {
 			const operationId = decodeURIComponent(path.slice('/jobs/'.length));

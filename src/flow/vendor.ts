@@ -37,7 +37,12 @@ export class VendorFlowPack extends Context.Tag('scheduling-bridge/VendorFlowPac
 			readonly service: Context.Tag.Service<ServiceMatcher>;
 			/* date, field matchers are 0.7.0 */
 		};
-		readonly flows: { readonly [flowId: string]: Flow<any, MiddlewareError, any> };
+		/** E includes `undefined`: the existing step programs carry `catch: () =>
+		 * undefined` branches, so their honest error channel is `MiddlewareError |
+		 * undefined` (exactly the worker's `runWizardStep` E channel). */
+		readonly flows: {
+			readonly [flowId: string]: Flow<any, MiddlewareError | undefined, any>;
+		};
 		readonly paymentInjection: 'native' | 'coupon-bypass' | 'external-link';
 	}
 >() {}

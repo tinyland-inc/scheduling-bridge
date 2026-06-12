@@ -162,6 +162,20 @@ const availabilitySnapshotAgeSeconds = new Gauge({
 	registers: [registry],
 });
 
+const flowShadowRunsTotal = new Counter({
+	name: 'acuity_flow_shadow_runs_total',
+	help: 'Flow shadow-mode comparisons of plan-predicted vs executed step sequences by flow and result',
+	labelNames: ['flow_id', 'result'],
+	registers: [registry],
+});
+
+const flowShadowStepMismatchTotal = new Counter({
+	name: 'acuity_flow_shadow_step_mismatch_total',
+	help: 'Flow shadow-mode per-step divergences between the plan-predicted and executed step ids',
+	labelNames: ['flow_id', 'step_id', 'kind'],
+	registers: [registry],
+});
+
 // ─── Derived cache hit-ratio ─────────────────────────────────────────────────
 //
 // `cacheHitRatio` is a derived gauge — prom-client cannot compute it for us,
@@ -334,6 +348,73 @@ export const setAvailabilitySnapshotAge = (
 	);
 };
 
+// ─── Flow shadow mode (design docs/design/flow-dag-formalization.md §10 0.6.0) ──
+//
+// While BRIDGE_FLOW_RUNNER is off (the default), the legacy execution paths diff the
+// FlowPlan-predicted step sequence against the step ids the legacy composition
+// actually executed. Plans only — no dual execution of effects, zero behavior change.
+// Step-id label cardinality is bounded by the registered flow plans (a handful of
+// stable ids), never per-request data.
+
+export type FlowShadowResult = 'match' | 'prefix' | 'mismatch';
+
+/**
+ * Compare the plan-predicted step-id sequence against the actually-executed one and
+ * record the outcome. A failed legacy run legitimately executes a prefix of the plan,
+ * so prefixes are distinguished from genuine shape mismatches.
+ */
+export const recordFlowShadowComparison = (
+	flowId: string,
+	predicted: readonly string[],
+	executed: readonly string[],
+): FlowShadowResult => {
+	const isPrefix =
+		executed.length <= predicted.length &&
+		executed.every((stepId, index) => stepId === predicted[index]);
+	const result: FlowShadowResult =
+		isPrefix && executed.length === predicted.length
+			? 'match'
+			: isPrefix
+				? 'prefix'
+				: 'mismatch';
+	flowShadowRunsTotal.inc({ flow_id: flowId, result });
+	if (result !== 'match') {
+		const executedSet = new Set(executed);
+		const predictedSet = new Set(predicted);
+		for (const stepId of predicted) {
+			if (!executedSet.has(stepId)) {
+				flowShadowStepMismatchTotal.inc({
+					flow_id: flowId,
+					step_id: stepId,
+					kind: 'missing',
+				});
+			}
+		}
+		for (const stepId of executed) {
+			if (!predictedSet.has(stepId)) {
+				flowShadowStepMismatchTotal.inc({
+					flow_id: flowId,
+					step_id: stepId,
+					kind: 'unexpected',
+				});
+			}
+		}
+		if (result === 'mismatch') {
+			const firstDivergence = executed.findIndex(
+				(stepId, index) => stepId !== predicted[index],
+			);
+			if (firstDivergence >= 0 && predictedSet.has(executed[firstDivergence])) {
+				flowShadowStepMismatchTotal.inc({
+					flow_id: flowId,
+					step_id: executed[firstDivergence],
+					kind: 'out_of_order',
+				});
+			}
+		}
+	}
+	return result;
+};
+
 // ─── Page-operation timer helper ─────────────────────────────────────────────
 //
 // Keep label cardinality low: `operation` should be a small enum of
@@ -406,6 +487,8 @@ export const metrics = {
 	bridgeQueueDepth,
 	bridgeQueueOldestAgeSeconds,
 	availabilitySnapshotAgeSeconds,
+	flowShadowRunsTotal,
+	flowShadowStepMismatchTotal,
 	recordCacheHit,
 	recordCacheMiss,
 	setBrowserPageLimiterState,
@@ -421,6 +504,7 @@ export const metrics = {
 	setBridgeQueueDepth,
 	setBridgeQueueOldestAge,
 	setAvailabilitySnapshotAge,
+	recordFlowShadowComparison,
 	observePageOp,
 	observePageOpEffect,
 	trackBrowserSession,

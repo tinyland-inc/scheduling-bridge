@@ -39,16 +39,49 @@ export class BridgeJobExecutionError extends Error {
 	}
 }
 
+/**
+ * Lease-time plan-hash skew signal (design docs/design/flow-dag-formalization.md §5
+ * plan-hash pinning): thrown by a flow-runner executor when the planHash pinned at
+ * enqueue does not match its constructed flow's hash and no effectful-once step has
+ * started. `executeBridgeJob` maps it to a REQUEUE (not a terminal failure) so a
+ * replica with the matching flow shape can drain the job during a rolling deploy.
+ */
+export class BridgeJobPlanSkewError extends Error {
+	readonly code: string;
+	readonly step?: string;
+
+	constructor(options: { code?: string; message: string; step?: string }) {
+		super(options.message);
+		this.name = 'BridgeJobPlanSkewError';
+		this.code = options.code ?? 'FLOW_PLAN_SKEW';
+		this.step = options.step;
+	}
+}
+
+/**
+ * Additive lease context handed to executors (0.6.0): the record identity plus the
+ * planHash/flowVersion pinned at enqueue, so flag-gated flow execution can key its
+ * journal rows and run the lease-time skew check. Optional everywhere — legacy
+ * executors ignore it.
+ */
+export interface BridgeJobLeaseContext {
+	readonly operationId?: string;
+	readonly planHash?: string;
+	readonly flowVersion?: string;
+}
+
 export interface BridgeJobExecutor {
 	refreshAvailabilityDates(
 		command: AvailabilityDatesRefreshCommand,
+		context?: BridgeJobLeaseContext,
 	): Promise<readonly AvailableDate[]>;
 	refreshAvailabilitySlots(
 		command: AvailabilitySlotsRefreshCommand,
+		context?: BridgeJobLeaseContext,
 	): Promise<readonly TimeSlot[]>;
 	createBookingWithPayment(
 		command: AppointmentCommand,
-		context: { executionPath: BookingExecutionPath },
+		context: { executionPath: BookingExecutionPath } & BridgeJobLeaseContext,
 	): Promise<Booking>;
 }
 
@@ -223,10 +256,16 @@ export const executeBridgeJob = async (
 	});
 	if (!running) return null;
 
+	const leaseContext: BridgeJobLeaseContext = {
+		operationId: record.operationId,
+		planHash: record.planHash,
+		flowVersion: record.flowVersion,
+	};
+
 	try {
 		if (record.kind === 'availability_dates_refresh') {
 			const command = record.command as AvailabilityDatesRefreshCommand;
-			const dates = await executor.refreshAvailabilityDates(command);
+			const dates = await executor.refreshAvailabilityDates(command, leaseContext);
 			await store.upsertAvailabilitySnapshot({
 				kind: 'dates',
 				serviceId: command.serviceId,
@@ -244,7 +283,7 @@ export const executeBridgeJob = async (
 
 		if (record.kind === 'availability_slots_refresh') {
 			const command = record.command as AvailabilitySlotsRefreshCommand;
-			const slots = await executor.refreshAvailabilitySlots(command);
+			const slots = await executor.refreshAvailabilitySlots(command, leaseContext);
 			await store.upsertAvailabilitySnapshot({
 				kind: 'slots',
 				serviceId: command.serviceId,
@@ -271,12 +310,22 @@ export const executeBridgeJob = async (
 		if (requeued) return requeued;
 		const booking = await executor.createBookingWithPayment(command, {
 			executionPath: selectBookingExecutionPath(command),
+			...leaseContext,
 		});
 		return store.completeJob(record.operationId, {
 			kind: 'booking_create_with_payment',
 			booking,
 		});
 	} catch (error) {
+		if (error instanceof BridgeJobPlanSkewError) {
+			return store.requeueJob(record.operationId, {
+				status: 'failed_pre_submit',
+				code: error.code,
+				message: error.message,
+				step: error.step,
+				retryable: true,
+			});
+		}
 		return store.failJob(record.operationId, failureFromUnknown(error));
 	}
 };

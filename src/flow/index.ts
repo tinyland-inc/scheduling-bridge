@@ -47,6 +47,11 @@ export {
 	type RecoveryEdge,
 } from './plan.js';
 export {
+	journalStepStatuses,
+	renderFlowMermaid,
+	type RenderFlowMermaidOptions,
+} from './mermaid.js';
+export {
 	FlowValidationError,
 	makeFlow,
 	type Flow,

@@ -17,6 +17,8 @@
  *   GET  /internal/availability/snapshot-canary - Auth-gated durable snapshot proof
  *   POST /internal/availability/heartbeat - Auth-gated bounded refresh heartbeat
  *   GET  /internal/flows            - Auth-gated registered FlowPlans (read-only)
+ *   POST /internal/flows/:flowId/plan - Auth-gated browser-free plan dry-run
+ *   GET  /internal/flows/:flowId/mermaid - Auth-gated mermaid projection (text/plain)
  *   POST /booking/create            - Create booking (standard)
  *   POST /booking/create-with-payment - Deprecated sync paid booking endpoint
  *   POST /booking/jobs              - Enqueue async paid booking job
@@ -42,7 +44,7 @@ import {
 	type ServerResponse,
 } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { Effect } from 'effect';
+import { Effect, Either } from 'effect';
 import { BrowserProcess } from '../shared/browser-service.js';
 import {
 	runBridgeReadCached,
@@ -75,7 +77,19 @@ import {
 	readDatesViaUrl,
 	readSlotsViaUrl,
 } from '../adapters/acuity/steps/read-via-url.js';
-import { acuityFlowEnqueuePinning, acuityFlows } from '../adapters/acuity/flows.js';
+import {
+	ACUITY_FLOW_MIN_CONFIDENCE,
+	acuityFlowEnqueuePinning,
+	acuityFlows,
+} from '../adapters/acuity/flows.js';
+import {
+	makeServiceMatcher,
+	type FuzzyResolution,
+	type ServiceCandidate,
+} from '../flow/fuzzy.js';
+import type { FlowCheckpoint, FlowJournalShape } from '../flow/journal.js';
+import { renderFlowMermaid } from '../flow/mermaid.js';
+import { selectFlowJournal } from './flow-runner.js';
 import { buildHealthPayload } from './health.js';
 import { handleReady as _handleReady } from './ready.js';
 import {
@@ -98,6 +112,7 @@ import type {
 	AvailabilityHeartbeatSkipped,
 	BridgeAdapterProfile,
 	BridgeJobCommand,
+	BridgeJobKind,
 	BridgeJobRecord,
 	BridgeJobStatus,
 	EnqueueBridgeJobResponse,
@@ -2118,6 +2133,264 @@ const handleInternalFlows = (res: ServerResponse) => {
 	});
 };
 
+/** Registered-flow lookup for the /internal/flows/:flowId/* surfaces. */
+const flowForId = (flowId: string) =>
+	Object.prototype.hasOwnProperty.call(acuityFlows, flowId)
+		? acuityFlows[flowId as BridgeJobKind]
+		: undefined;
+
+const sendUnknownFlow = (res: ServerResponse, flowId: string) =>
+	sendJson(res, 404, {
+		success: false,
+		error: {
+			tag: 'InfrastructureError',
+			code: 'NOT_FOUND',
+			message: `Unknown flow: ${flowId}`,
+		},
+	});
+
+/**
+ * Read-side flow journal for the mermaid overlay. Lazy so the flag-off / no-journal
+ * deployments never construct a backend; rides the same selection order as the
+ * worker (Postgres → shared Redis client → REDIS_URL → memory).
+ */
+let flowJournalForReads: FlowJournalShape | null = null;
+const getFlowJournalForReads = (): FlowJournalShape =>
+	(flowJournalForReads ??= selectFlowJournal({ redisClient }));
+
+export const __setFlowJournalForTest = (journal: FlowJournalShape | null) => {
+	flowJournalForReads = journal;
+};
+
+/**
+ * POST /internal/flows/:flowId/plan — browser-free plan dry-run (design §5 "Plan vs
+ * execute", §10 0.6.x). Executes ONLY plan-safe resolution: a fuzzy service match
+ * against the service catalog (shared/acuity-service-catalog.ts) with confidence,
+ * plus snapshot freshness classification under the existing
+ * observedAt/staleAt/expiresAt semantics. Returns the FlowPlan, resolutions, and
+ * warnings. NO write-class node runs and NO browser layer is provisioned — this
+ * handler never touches `runEffect`/`browserRuntime`.
+ */
+const handleInternalFlowPlanDryRun = async (
+	flowId: string,
+	req: IncomingMessage,
+	res: ServerResponse,
+) => {
+	if (!AUTH_TOKEN) {
+		return notFoundInternalEndpoint(res);
+	}
+	const flow = flowForId(flowId);
+	if (!flow) {
+		return sendUnknownFlow(res, flowId);
+	}
+
+	const rawBody = await parseBody(req);
+	if (!isRecord(rawBody)) {
+		return sendValidationError(res, 'body', 'Request body must be an object');
+	}
+	const serviceId = optionalString(rawBody.serviceId);
+	if (!isNonEmptyString(serviceId)) {
+		return sendValidationError(res, 'serviceId', 'serviceId is required');
+	}
+	const serviceName = isNonEmptyString(rawBody.serviceName)
+		? rawBody.serviceName
+		: undefined;
+	let month: string | undefined;
+	if (rawBody.month !== undefined) {
+		if (typeof rawBody.month !== 'string' || !YEAR_MONTH_RE.test(rawBody.month)) {
+			return sendValidationError(res, 'month', 'month must be formatted as YYYY-MM');
+		}
+		month = rawBody.month;
+	}
+	let date: string | undefined;
+	if (rawBody.date !== undefined) {
+		if (typeof rawBody.date !== 'string' || !ISO_DATE_RE.test(rawBody.date)) {
+			return sendValidationError(res, 'date', 'date must be formatted as YYYY-MM-DD');
+		}
+		date = rawBody.date;
+	}
+	const datetime =
+		typeof rawBody.datetime === 'string' ? rawBody.datetime : undefined;
+
+	const warnings: string[] = [];
+
+	// --- Plan-safe fuzzy-in: catalog-backed service match (design §6) ---
+	let candidates: ServiceCandidate[];
+	try {
+		const services = await serviceCatalog.getServices();
+		candidates = services.map((service) => ({
+			label: service.name,
+			ref: service.id,
+		}));
+	} catch (error) {
+		return sendError(res, 500, Errors.infrastructure('UNKNOWN', describeLogValue(error)));
+	}
+
+	const minConfidence = ACUITY_FLOW_MIN_CONFIDENCE[flowId as BridgeJobKind];
+	const matcher = makeServiceMatcher(minConfidence);
+	const matchResult = await Effect.runPromise(
+		Effect.either(
+			matcher.match(
+				{
+					serviceName: serviceName ?? serviceId,
+					...(isAcuityAppointmentTypeId(serviceId)
+						? { appointmentTypeId: serviceId }
+						: {}),
+				},
+				candidates,
+			),
+		),
+	);
+
+	const resolutions: Array<
+		{ readonly field: 'service' } & FuzzyResolution<ServiceCandidate>
+	> = [];
+	let matchSummary: string;
+	if (Either.isRight(matchResult)) {
+		const resolution = matchResult.right;
+		resolutions.push({ field: 'service', ...resolution });
+		matchSummary = `service matched ${resolution.confidence.toFixed(2)} ${resolution.strategy}`;
+		if (resolution.strategy === 'token-overlap' || resolution.strategy === 'fuzzy') {
+			warnings.push(
+				`service resolved by tolerant ${resolution.strategy} match ('${resolution.matchedLabel}' at ${resolution.confidence.toFixed(2)})`,
+			);
+		}
+	} else {
+		const failure = matchResult.left;
+		matchSummary = 'service match failed';
+		warnings.push(
+			`service match failed below minConfidence ${failure.threshold}: ${failure.message} (best confidence ${failure.bestConfidence.toFixed(2)})`,
+		);
+	}
+
+	// --- Snapshot freshness classification (existing observedAt/staleAt/expiresAt
+	// semantics; never refreshes, never enqueues) ---
+	const snapshotProbe =
+		flowId === 'availability_dates_refresh'
+			? month
+				? { kind: 'dates' as const, scope: month }
+				: undefined
+			: flowId === 'availability_slots_refresh'
+				? date
+					? { kind: 'slots' as const, scope: date }
+					: undefined
+				: (() => {
+						const bookingScope =
+							datetime && /^\d{4}-\d{2}-\d{2}/.test(datetime)
+								? datetime.slice(0, 10)
+								: date;
+						return bookingScope
+							? { kind: 'slots' as const, scope: bookingScope }
+							: undefined;
+					})();
+
+	let snapshotReport:
+		| {
+				readonly kind: AvailabilitySnapshotKind;
+				readonly scope: string;
+				readonly freshness: 'fresh' | 'stale' | 'expired' | 'missing';
+				readonly observedAt?: string;
+				readonly staleAt?: string;
+				readonly expiresAt?: string;
+		  }
+		| null = null;
+	if (snapshotProbe) {
+		const snapshot = await bridgeAsyncStore.getAvailabilitySnapshot({
+			kind: snapshotProbe.kind,
+			serviceId,
+			scope: snapshotProbe.scope,
+			baseUrl: ACUITY_BASE_URL,
+		});
+		const freshness = snapshot
+			? classifyAvailabilitySnapshotFreshness(snapshot)
+			: ('missing' as const);
+		snapshotReport = {
+			kind: snapshotProbe.kind,
+			scope: snapshotProbe.scope,
+			freshness,
+			...(snapshot
+				? {
+						observedAt: snapshot.observedAt,
+						staleAt: snapshot.staleAt,
+						expiresAt: snapshot.expiresAt,
+					}
+				: {}),
+		};
+		if (freshness !== 'fresh') {
+			warnings.push(
+				`${snapshotProbe.kind} snapshot ${freshness} (scope ${snapshotProbe.scope})`,
+			);
+		}
+	}
+
+	sendSuccess(res, {
+		layer: 'bridge_flow_plan_dry_run',
+		mode: 'plan',
+		flowId: flow.plan.flowId,
+		backend: flow.plan.backend,
+		version: flow.plan.version,
+		planHash: flow.planHash,
+		plan: flow.plan,
+		summary: `path ${flow.plan.nodes.map((node) => node.stepId).join(' -> ')}; ${matchSummary}${
+			snapshotReport
+				? `; ${snapshotReport.kind} snapshot ${snapshotReport.freshness}`
+				: ''
+		}`,
+		resolutions,
+		snapshot: snapshotReport,
+		warnings,
+	});
+};
+
+/**
+ * GET /internal/flows/:flowId/mermaid — read-only mermaid projection of a FlowPlan
+ * (design §10 0.6.x "Mermaid emission with journal overlay"). Pure projection: no
+ * execution, no browser; the optional `?operationId=` overlay reads FlowJournal rows
+ * to mark per-step status.
+ */
+const handleInternalFlowMermaid = async (
+	flowId: string,
+	requestUrl: URL,
+	res: ServerResponse,
+) => {
+	if (!AUTH_TOKEN) {
+		return notFoundInternalEndpoint(res);
+	}
+	const flow = flowForId(flowId);
+	if (!flow) {
+		return sendUnknownFlow(res, flowId);
+	}
+
+	const operationIdParam = requestUrl.searchParams.get('operationId');
+	const operationId =
+		operationIdParam && operationIdParam.length > 0 ? operationIdParam : undefined;
+
+	let journalRows: readonly FlowCheckpoint[] | undefined;
+	if (operationId) {
+		try {
+			journalRows = await Effect.runPromise(
+				getFlowJournalForReads().read(operationId),
+			);
+		} catch (error) {
+			return sendJson(res, 500, {
+				success: false,
+				error: {
+					tag: 'InfrastructureError',
+					code: 'JOURNAL_READ_FAILED',
+					message: describeLogValue(error),
+				},
+			});
+		}
+	}
+
+	const diagram = renderFlowMermaid(
+		flow.plan,
+		journalRows ? { journal: journalRows } : undefined,
+	);
+	res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+	res.end(diagram);
+};
+
 // =============================================================================
 // SERVER
 // =============================================================================
@@ -2224,6 +2497,26 @@ const server = createServer(async (req, res) => {
 		}
 		if (path === '/internal/flows' && method === 'GET') {
 			return handleInternalFlows(res);
+		}
+		if (
+			path.startsWith('/internal/flows/') &&
+			path.endsWith('/plan') &&
+			method === 'POST'
+		) {
+			const flowId = decodeURIComponent(
+				path.slice('/internal/flows/'.length, path.length - '/plan'.length),
+			);
+			return await handleInternalFlowPlanDryRun(flowId, req, res);
+		}
+		if (
+			path.startsWith('/internal/flows/') &&
+			path.endsWith('/mermaid') &&
+			method === 'GET'
+		) {
+			const flowId = decodeURIComponent(
+				path.slice('/internal/flows/'.length, path.length - '/mermaid'.length),
+			);
+			return await handleInternalFlowMermaid(flowId, url, res);
 		}
 		if (path.startsWith('/jobs/') && method === 'GET') {
 			const operationId = decodeURIComponent(path.slice('/jobs/'.length));

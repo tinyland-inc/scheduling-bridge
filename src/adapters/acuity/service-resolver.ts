@@ -44,7 +44,7 @@ export interface ServiceResolverShape {
 // CONTEXT TAG
 // =============================================================================
 
-export class ServiceResolver extends Context.Tag('scheduling-kit/ServiceResolver')<
+export class ServiceResolver extends Context.Tag('scheduling-bridge/ServiceResolver')<
 	ServiceResolver,
 	ServiceResolverShape
 >() {}

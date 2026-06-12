@@ -68,7 +68,7 @@ export interface BrowserServiceShape {
 	readonly config: BrowserConfig;
 }
 
-export class BrowserService extends Context.Tag('scheduling-kit/BrowserService')<
+export class BrowserService extends Context.Tag('scheduling-bridge/BrowserService')<
 	BrowserService,
 	BrowserServiceShape
 >() {}
@@ -78,7 +78,7 @@ export interface BrowserProcessShape {
 	readonly config: BrowserConfig;
 }
 
-export class BrowserProcess extends Context.Tag('scheduling-kit/BrowserProcess')<
+export class BrowserProcess extends Context.Tag('scheduling-bridge/BrowserProcess')<
 	BrowserProcess,
 	BrowserProcessShape
 >() {}

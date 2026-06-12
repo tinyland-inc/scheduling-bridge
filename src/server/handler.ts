@@ -41,24 +41,8 @@ import {
 	type ServerResponse,
 } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { Effect, Exit, Cause, ManagedRuntime, Scope } from 'effect';
-import { Redis as IORedisImpl } from 'ioredis';
-import type { Redis as IORedis } from 'ioredis';
-import type { ScraperConfig } from '../adapters/acuity/scraper.js';
-import {
-	BrowserProcessLive,
-	BrowserProcess,
-	BrowserService,
-	BrowserSessionLive,
-	type BrowserConfig,
-	defaultBrowserConfig,
-} from '../shared/browser-service.js';
-import {
-	createAcuityServiceCatalog,
-	parseStaticServicesJson,
-	type ServiceCatalogRedisL2,
-} from '../shared/acuity-service-catalog.js';
-import { getCached as redisL2GetCached, RedisL2 } from '../shared/redis-l2.js';
+import { Effect } from 'effect';
+import { BrowserProcess } from '../shared/browser-service.js';
 import {
 	runBridgeReadCached,
 	type BridgeReadCacheClient,
@@ -75,10 +59,6 @@ import {
 	setBridgeQueueDepth,
 	setBridgeQueueOldestAge,
 } from '../shared/metrics.js';
-import {
-	toSchedulingError,
-	type MiddlewareError,
-} from '../adapters/acuity/errors.js';
 import {
 	navigateToBooking,
 	fillFormFields,
@@ -98,22 +78,12 @@ import { buildHealthPayload } from './health.js';
 import { handleReady as _handleReady } from './ready.js';
 import {
 	buildAvailabilityDatesCacheKey,
-	getDatePrewarmMonths,
 	selectDatePrewarmMonths,
 } from './date-prewarm.js';
 import {
 	buildAvailabilitySlotsCacheKey,
-	getSlotPrewarmLimit,
 	selectSlotPrewarmDates,
 } from './slot-prewarm.js';
-import { ndjsonLog } from '../shared/logger.js';
-import {
-	createInMemoryBridgeAsyncStore,
-	type BridgeAsyncStore,
-} from '../async/store.js';
-import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
-import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
-import { parseRedisAsyncJobTtlSeconds } from '../async/config.js';
 import type {
 	AvailabilitySnapshot,
 	AvailabilitySnapshotKind,
@@ -130,19 +100,63 @@ import type {
 	BridgeJobStatus,
 	EnqueueBridgeJobResponse,
 } from '../async/types.js';
-import {
-	createAcuityBridgeJobExecutor,
-	runBridgeWorkerLoop,
-} from './worker.js';
 import type {
-	Booking,
 	BookingRequest,
 	AvailableDate,
-	Service,
-	SchedulingError,
 	TimeSlot,
 } from '../core/types.js';
 import { Errors } from '../core/types.js';
+import {
+	ACUITY_BASE_URL,
+	AUTH_TOKEN,
+	browserConfig,
+	COUPON_CODE,
+	DATE_PREWARM_MONTHS,
+	EMPTY_READ_CACHE_TTL_SECONDS,
+	HEARTBEAT_DEFAULT_IDEMPOTENCY_WINDOW_MS,
+	HEARTBEAT_DEFAULT_MAX_JOBS,
+	HEARTBEAT_MAX_JOBS_CAP,
+	PORT,
+	READ_CACHE_LOCK_TTL_MS,
+	READ_CACHE_TTL_SECONDS,
+	READ_CACHE_WAIT_TIMEOUT_MS,
+	READINESS_DEFAULT_FRESHNESS_FLOOR_MS,
+	READINESS_DEFAULT_MAX_OLDEST_QUEUED_AGE_MS,
+	READINESS_WAIT_DEFAULT_POLL_MS,
+	READINESS_WAIT_DEFAULT_TIMEOUT_MS,
+	SERVICE_CACHE_TTL_MS,
+	SLOT_PREWARM_LIMIT,
+} from './config.js';
+import {
+	createSlotReadTelemetryContext,
+	describeLogValue,
+	logEvent,
+	logRequestEvent,
+	parseBody,
+	sendError,
+	sendJson,
+	sendSuccess,
+	sendValidationError,
+	type RequestContext,
+} from './http.js';
+import { browserRuntime, runEffect, type Result } from './runtime.js';
+import {
+	bridgeAsyncStore,
+	disposeBridgeAsyncStore,
+	disposeRedisClient,
+	redisClient,
+	serviceCatalog,
+	startInlineWorker,
+	stopInlineWorker,
+} from './stores.js';
+import {
+	ISO_DATE_RE,
+	isNonEmptyString,
+	isRecord,
+	isSchedulingError,
+	optionalString,
+	YEAR_MONTH_RE,
+} from './validation.js';
 
 const acuitySteps = {
 	navigateToBooking,
@@ -164,503 +178,14 @@ export const __setAcuityStepOverridesForTest = (
 	Object.assign(acuitySteps, overrides);
 };
 
-// =============================================================================
-// CONFIGURATION
-// =============================================================================
-
-const PORT = Number(process.env.PORT ?? 3001);
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
-const ACUITY_BASE_URL = process.env.ACUITY_BASE_URL ?? 'https://example.as.me';
-const COUPON_CODE = process.env.ACUITY_BYPASS_COUPON;
-const SERVICE_CACHE_TTL_MS = (() => {
-	const parsed = Number(process.env.ACUITY_SERVICE_CACHE_TTL_MS ?? 5 * 60_000);
-	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 60_000;
-})();
-const READ_CACHE_TTL_SECONDS = (() => {
-	const parsed = Number(process.env.ACUITY_READ_CACHE_TTL_SECONDS ?? 20 * 60);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 20 * 60;
-})();
-const EMPTY_READ_CACHE_TTL_SECONDS = (() => {
-	const parsed = Number(
-		process.env.ACUITY_EMPTY_READ_CACHE_TTL_SECONDS ?? 2 * 60,
-	);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 2 * 60;
-})();
-const READ_CACHE_LOCK_TTL_MS = (() => {
-	const parsed = Number(process.env.ACUITY_READ_CACHE_LOCK_TTL_MS ?? 90_000);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 90_000;
-})();
-const READ_CACHE_WAIT_TIMEOUT_MS = (() => {
-	const parsed = Number(
-		process.env.ACUITY_READ_CACHE_WAIT_TIMEOUT_MS ?? 55_000,
-	);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 55_000;
-})();
-const DATE_PREWARM_MONTHS = getDatePrewarmMonths();
-const SLOT_PREWARM_LIMIT = getSlotPrewarmLimit();
-const HEARTBEAT_DEFAULT_MAX_JOBS = (() => {
-	const parsed = Number(process.env.BRIDGE_HEARTBEAT_MAX_JOBS ?? 12);
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 12;
-})();
-const HEARTBEAT_MAX_JOBS_CAP = 100;
-const HEARTBEAT_DEFAULT_IDEMPOTENCY_WINDOW_MS = (() => {
-	const parsed = Number(
-		process.env.BRIDGE_HEARTBEAT_IDEMPOTENCY_WINDOW_MS ?? 5 * 60_000,
-	);
-	return Number.isFinite(parsed) && parsed > 0
-		? Math.floor(parsed)
-		: 5 * 60_000;
-})();
-const READINESS_DEFAULT_FRESHNESS_FLOOR_MS = (() => {
-	const parsed = Number(
-		process.env.BRIDGE_READINESS_FRESHNESS_FLOOR_MS ?? 90_000,
-	);
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 90_000;
-})();
-const READINESS_DEFAULT_MAX_OLDEST_QUEUED_AGE_MS = (() => {
-	const parsed = Number(
-		process.env.BRIDGE_READINESS_MAX_OLDEST_QUEUED_AGE_MS ?? 120_000,
-	);
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 120_000;
-})();
-const READINESS_WAIT_DEFAULT_TIMEOUT_MS = (() => {
-	const parsed = Number(process.env.BRIDGE_READINESS_WAIT_TIMEOUT_MS ?? 60_000);
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 60_000;
-})();
-const READINESS_WAIT_DEFAULT_POLL_MS = (() => {
-	const parsed = Number(process.env.BRIDGE_READINESS_WAIT_POLL_MS ?? 1000);
-	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1000;
-})();
-
-const browserConfig: BrowserConfig = {
-	...defaultBrowserConfig,
-	baseUrl: ACUITY_BASE_URL,
-	headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-	timeout: Number(process.env.PLAYWRIGHT_TIMEOUT ?? 30000),
-	executablePath: process.env.CHROMIUM_EXECUTABLE_PATH,
-	launchArgs: process.env.CHROMIUM_LAUNCH_ARGS?.split(','),
-};
-
-const scraperConfig: ScraperConfig = {
-	baseUrl: ACUITY_BASE_URL,
-	headless: browserConfig.headless,
-	timeout: browserConfig.timeout,
-	userAgent: browserConfig.userAgent,
-	executablePath: browserConfig.executablePath,
-	launchArgs: browserConfig.launchArgs
-		? [...browserConfig.launchArgs]
-		: undefined,
-};
-
-// =============================================================================
-// RESPONSE HELPERS
-// =============================================================================
-
-interface SuccessResponse<T> {
-	success: true;
-	data: T;
-}
-
-interface ErrorResponse {
-	success: false;
-	error: {
-		tag: string;
-		code: string;
-		message: string;
-	};
-}
-
-const sendJson = (
-	res: ServerResponse,
-	status: number,
-	body: SuccessResponse<unknown> | ErrorResponse,
-) => {
-	res.writeHead(status, { 'Content-Type': 'application/json' });
-	res.end(JSON.stringify(body));
-};
-
-const sendSuccess = <T>(res: ServerResponse, data: T) =>
-	sendJson(res, 200, { success: true, data });
-
-const sendError = (res: ServerResponse, status: number, err: SchedulingError) =>
-	sendJson(res, status, {
-		success: false,
-		error: {
-			tag: err._tag,
-			code: 'code' in err ? (err as { code: string }).code : err._tag,
-			message:
-				'message' in err
-					? (err as { message: string }).message
-					: 'Unknown error',
-		},
-	});
-
-const sendValidationError = (
-	res: ServerResponse,
-	code: string,
-	message: string,
-) =>
-	sendJson(res, 400, {
-		success: false,
-		error: {
-			tag: 'ValidationError',
-			code,
-			message,
-		},
-	});
-
-const parseBody = async (req: IncomingMessage): Promise<unknown> => {
-	const chunks: Buffer[] = [];
-	for await (const chunk of req) {
-		chunks.push(chunk as Buffer);
-	}
-	const raw = Buffer.concat(chunks).toString('utf8');
-	return raw ? JSON.parse(raw) : {};
-};
-
-type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
-
-interface RequestContext {
-	readonly requestId: string;
-	readonly method: string;
-	readonly path: string;
-	readonly startedAt: number;
-}
-
-const runtimeLogFields = () => ({
-	flowOwner: 'scheduling-bridge',
-	backend: 'acuity',
-	transport: 'http-json',
-	modalEnvironment: process.env.MODAL_ENVIRONMENT,
-	releaseSha: process.env.MIDDLEWARE_RELEASE_SHA,
-	releaseVersion:
-		process.env.MIDDLEWARE_RELEASE_VERSION ?? process.env.npm_package_version,
-});
-
-const logEvent = (
-	level: LogLevel,
-	msg: string,
-	data?: Record<string, unknown>,
-) => {
-	ndjsonLog(level, msg, {
-		...runtimeLogFields(),
-		...data,
-	});
-};
-
-const logRequestEvent = (
-	level: LogLevel,
-	msg: string,
-	context: RequestContext,
-	data?: Record<string, unknown>,
-) => {
-	logEvent(level, msg, {
-		event: 'request',
-		requestId: context.requestId,
-		method: context.method,
-		path: context.path,
-		...data,
-	});
-};
-
-const describeLogValue = (value: unknown): string => {
-	if (typeof value === 'string') return value;
-	if (value instanceof Error) return value.message;
-	try {
-		return JSON.stringify(value);
-	} catch {
-		return String(value);
-	}
-};
-
-const createServiceCatalogLogger = () => ({
-	log: (...args: unknown[]) =>
-		logEvent('INFO', 'Service catalog event', {
-			event: 'service_catalog',
-			detail: args.map(describeLogValue).join(' '),
-		}),
-	warn: (...args: unknown[]) =>
-		logEvent('WARN', 'Service catalog warning', {
-			event: 'service_catalog',
-			detail: args.map(describeLogValue).join(' '),
-		}),
-	error: (...args: unknown[]) =>
-		logEvent('ERROR', 'Service catalog error', {
-			event: 'service_catalog',
-			detail: args.map(describeLogValue).join(' '),
-		}),
-});
-
-const createSlotReadTelemetryContext = (
-	context: RequestContext,
-	endpoint: string,
-) => ({
-	requestId: context.requestId,
-	endpoint,
-	...runtimeLogFields(),
-});
-
-// =============================================================================
-// EFFECT RUNNER
-// =============================================================================
-
-const browserRuntime = ManagedRuntime.make(BrowserProcessLive(browserConfig));
-
-type Result<A> = { ok: true; value: A } | { ok: false; error: SchedulingError };
-
-const exitToResult = <A>(
-	exit: Exit.Exit<A, MiddlewareError | undefined>,
-): Result<A> => {
-	if (Exit.isSuccess(exit)) {
-		return { ok: true, value: exit.value };
-	}
-	const failure = Cause.failureOption(exit.cause);
-	if (failure._tag === 'Some' && failure.value !== undefined) {
-		return { ok: false, error: toSchedulingError(failure.value) };
-	}
-	return {
-		ok: false,
-		error: {
-			_tag: 'InfrastructureError',
-			code: 'UNKNOWN',
-			message: Cause.pretty(exit.cause),
-		},
-	};
-};
-
-type RunEffect = <A>(
-	effect: Effect.Effect<
-		A,
-		MiddlewareError | undefined,
-		BrowserService | Scope.Scope
-	>,
-) => Promise<Result<A>>;
-
-const runEffectWithBrowser: RunEffect = async <A>(
-	effect: Effect.Effect<
-		A,
-		MiddlewareError | undefined,
-		BrowserService | Scope.Scope
-	>,
-): Promise<Result<A>> => {
-	const exit = await browserRuntime.runPromiseExit(
-		Effect.scoped(effect.pipe(Effect.provide(BrowserSessionLive))),
-	);
-	return exitToResult(exit);
-};
-
-let runEffect: RunEffect = runEffectWithBrowser;
-
-export const __runEffectWithoutBrowserForTest: RunEffect = async <A>(
-	effect: Effect.Effect<
-		A,
-		MiddlewareError | undefined,
-		BrowserService | Scope.Scope
-	>,
-): Promise<Result<A>> => {
-	const exit = await Effect.runPromiseExit(
-		effect as Effect.Effect<A, MiddlewareError | undefined, never>,
-	);
-	return exitToResult(exit);
-};
-
-export const __setEffectRunnerForTest = (runner: RunEffect | null) => {
-	runEffect = runner ?? runEffectWithBrowser;
-};
-
-// =============================================================================
-// REDIS L2 CLIENT + ADAPTER SHIM
-// =============================================================================
-//
-// `RedisL2.getCached` (from `shared/redis-l2.ts`) expects `mk: () => Promise<A>`
-// because its Effect.gen generator internally calls `Effect.tryPromise({ try:
-// () => mk(), ... })`. But `ServiceCatalogRedisL2.getCached` (the structural
-// interface the catalog depends on) takes `mk: Effect.Effect<A>` so that
-// non-Node callers and tests stay Effect-native.
-//
-// This shim bridges the two: the catalog hands us an Effect, we wrap it as a
-// Promise via `Effect.runPromise`, pass it into the real `getCached`, and
-// provide the `RedisL2` service via a module-level singleton ioredis client.
-//
-// If REDIS_URL is missing (local dev), `redisL2` stays `undefined` and the
-// catalog falls back to its in-process single-flight path.
-
-const BRIDGE_DATABASE_URL = process.env.BRIDGE_DATABASE_URL;
-const REDIS_URL = process.env.REDIS_URL;
-const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
-const BRIDGE_INLINE_WORKER_ENABLED = (() => {
-	const raw = process.env.BRIDGE_INLINE_WORKER_ENABLED;
-	if (raw === 'true') return true;
-	if (raw === 'false') return false;
-	return Boolean(BRIDGE_DATABASE_URL || REDIS_URL);
-})();
-
-const redisClient: IORedis | null = REDIS_URL
-	? new IORedisImpl(REDIS_URL, {
-			password: REDIS_PASSWORD,
-			maxRetriesPerRequest: 3,
-		})
-	: null;
-
-// Declare which cache tier is active at boot so operators can diagnose silent
-// L1-only degradation (e.g. REDIS_URL accidentally unset in prod) from logs
-// alone, without having to probe the running process.
-logEvent('INFO', 'Cache mode selected', {
-	event: 'cache_mode_selected',
-	mode: redisClient ? 'l1+l2' : 'l1-only',
-	redisConfigured: Boolean(process.env.REDIS_URL),
-});
-
-if (redisClient) {
-	redisClient.on('error', (e) => {
-		logEvent('ERROR', 'Redis L2 client error', {
-			event: 'redis_client_error',
-			error: describeLogValue(e),
-		});
-	});
-}
-
-const serviceCatalogRedisL2: ServiceCatalogRedisL2 | undefined = redisClient
-	? {
-			getCached: <A>(
-				key: string,
-				ttlSeconds: number,
-				mk: Effect.Effect<A>,
-			): Effect.Effect<A> => {
-				const mkPromise = (): Promise<A> => Effect.runPromise(mk);
-				// Provide the RedisL2 service for the real `getCached`, then erase
-				// the `RedisError | CacheTimeoutError` channel so the result fits
-				// the `Effect.Effect<A>` shape expected by the catalog. Defects
-				// propagate as rejections through `Effect.runPromise` in the
-				// catalog, preserving the error-surface contract documented in
-				// `acuity-service-catalog.ts`.
-				return redisL2GetCached(key, ttlSeconds, mkPromise).pipe(
-					Effect.provideService(RedisL2, redisClient),
-					Effect.orDie,
-				);
-			},
-		}
-	: undefined;
-
-const serviceCatalog = createAcuityServiceCatalog({
-	baseUrl: ACUITY_BASE_URL,
-	cacheTtlMs: SERVICE_CACHE_TTL_MS,
-	staticServices: parseStaticServicesJson(process.env.SERVICES_JSON),
-	scraperConfig,
-	logger: createServiceCatalogLogger(),
-	redisL2: serviceCatalogRedisL2,
-});
-
-let closeBridgeAsyncStore: (() => Promise<void>) | null = null;
-
-const createBridgeAsyncStore = (): BridgeAsyncStore => {
-	if (BRIDGE_DATABASE_URL) {
-		const store = createPostgresBridgeAsyncStore({
-			connectionString: BRIDGE_DATABASE_URL,
-			ssl: process.env.BRIDGE_DATABASE_SSL === 'true',
-			migrate: process.env.BRIDGE_DATABASE_MIGRATE !== 'false',
-		});
-		closeBridgeAsyncStore = store.close;
-		void store.ready().catch((error) => {
-			logEvent('ERROR', 'Bridge async Postgres store migration failed', {
-				event: 'bridge_async_store_ready_failed',
-				error: describeLogValue(error),
-			});
-		});
-		logEvent('INFO', 'Bridge async store selected', {
-			event: 'bridge_async_store_selected',
-			mode: 'postgres',
-			migrate: process.env.BRIDGE_DATABASE_MIGRATE !== 'false',
-		});
-		return store;
-	}
-	if (redisClient) {
-		const store = createRedisBridgeAsyncStore({
-			client: redisClient,
-			keyPrefix: process.env.BRIDGE_REDIS_ASYNC_PREFIX,
-			jobTtlSeconds: parseRedisAsyncJobTtlSeconds(),
-		});
-		void store.ready().catch((error) => {
-			logEvent('ERROR', 'Bridge async Redis store readiness failed', {
-				event: 'bridge_async_store_ready_failed',
-				error: describeLogValue(error),
-			});
-		});
-		logEvent('INFO', 'Bridge async store selected', {
-			event: 'bridge_async_store_selected',
-			mode: 'redis',
-		});
-		return store;
-	}
-	logEvent('INFO', 'Bridge async store selected', {
-		event: 'bridge_async_store_selected',
-		mode: 'memory',
-	});
-	return createInMemoryBridgeAsyncStore();
-};
-
-let bridgeAsyncStore: BridgeAsyncStore = createBridgeAsyncStore();
-let inlineWorkerAbortController: AbortController | null = null;
-
-const startInlineWorker = () => {
-	if (!BRIDGE_INLINE_WORKER_ENABLED || inlineWorkerAbortController) return;
-	inlineWorkerAbortController = new AbortController();
-	const workerId = `${process.env.HOSTNAME ?? `pid-${process.pid}`}:inline`;
-	void runBridgeWorkerLoop(
-		bridgeAsyncStore,
-		createAcuityBridgeJobExecutor({ redisClient }),
-		{
-			workerId,
-			signal: inlineWorkerAbortController.signal,
-		},
-	).catch((error) => {
-		if (inlineWorkerAbortController?.signal.aborted) return;
-		logEvent('ERROR', 'Inline bridge worker failed', {
-			event: 'bridge_inline_worker_failed',
-			workerId,
-			error: describeLogValue(error),
-		});
-	});
-	logEvent('INFO', 'Inline bridge worker started', {
-		event: 'bridge_inline_worker_started',
-		workerId,
-		store: BRIDGE_DATABASE_URL ? 'postgres' : redisClient ? 'redis' : 'memory',
-	});
-};
-
-const stopInlineWorker = () => {
-	if (!inlineWorkerAbortController) return;
-	inlineWorkerAbortController.abort();
-	inlineWorkerAbortController = null;
-};
-
-export const __setBridgeAsyncStoreForTest = (
-	store: BridgeAsyncStore | null,
-) => {
-	stopInlineWorker();
-	if (closeBridgeAsyncStore) {
-		void closeBridgeAsyncStore().catch(() => undefined);
-		closeBridgeAsyncStore = null;
-	}
-	bridgeAsyncStore = store ?? createInMemoryBridgeAsyncStore();
-};
-
-const isSchedulingError = (error: unknown): error is SchedulingError =>
-	typeof error === 'object' && error !== null && '_tag' in error;
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-	typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const isNonEmptyString = (value: unknown): value is string =>
-	typeof value === 'string' && value.trim().length > 0;
-
-const optionalString = (value: unknown): string | undefined | null => {
-	if (value === undefined) return undefined;
-	return typeof value === 'string' ? value : null;
-};
-
-const YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Test seams moved by the handler decomposition (phase 1) keep their original
+// import path: everything external (especially the server test suites)
+// imports them from `./handler.js`, so they are re-exported here.
+export {
+	__runEffectWithoutBrowserForTest,
+	__setEffectRunnerForTest,
+} from './runtime.js';
+export { __setBridgeAsyncStoreForTest } from './stores.js';
 
 interface AvailabilityHeartbeatCandidate {
 	readonly kind: AvailabilitySnapshotKind;
@@ -2720,17 +2245,6 @@ const disposeBrowserRuntime = () => {
 			error: describeLogValue(error),
 		});
 	});
-};
-
-const disposeRedisClient = () => {
-	if (!redisClient) return;
-	void redisClient.quit().catch(() => undefined);
-};
-
-const disposeBridgeAsyncStore = () => {
-	if (!closeBridgeAsyncStore) return;
-	void closeBridgeAsyncStore().catch(() => undefined);
-	closeBridgeAsyncStore = null;
 };
 
 server.on('close', stopInlineWorker);

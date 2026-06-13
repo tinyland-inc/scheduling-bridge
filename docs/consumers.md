@@ -25,7 +25,7 @@ Current downstream consumers should depend on the published package:
   ```json
   {
     "dependencies": {
-      "@tummycrypt/scheduling-bridge": "npm:@jesssullivan/scheduling-bridge@^0.6.0",
+      "@tummycrypt/scheduling-bridge": "npm:@jesssullivan/scheduling-bridge@^0.6.1",
       "@tummycrypt/scheduling-kit": "npm:@jesssullivan/scheduling-kit@^0.9.1"
     }
   }

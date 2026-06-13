@@ -1,6 +1,6 @@
 {
   "name": "@tummycrypt/scheduling-bridge",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Backend-agnostic scheduling adapter hub with Playwright automation",
   "type": "module",
   "packageManager": "pnpm@9.15.9",

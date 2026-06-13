@@ -52,11 +52,11 @@ As of `2026-06-11`, the active structural work here is:
 
 Operationally relevant truth:
 
-- current package metadata is `@tummycrypt/scheduling-bridge` `0.6.0`,
+- current package metadata is `@tummycrypt/scheduling-bridge` `0.6.1`,
   delivered through GitHub Packages as `@jesssullivan/scheduling-bridge`
 - npmjs is frozen at `0.5.11` and retired for new versions; existing npmjs
   consumers keep resolving the frozen versions
-- `0.6.0` resolves `tummycrypt_scheduling_kit` `0.9.1` from the Bazel module
+- `0.6.1` resolves `tummycrypt_scheduling_kit` `0.9.1` from the Bazel module
   graph and declares `@tummycrypt/scheduling-kit ^0.9.1` as a required
   `peerDependency` (npm metadata); `0.5.13` depended on the kit `^0.8.0` via
   npm metadata

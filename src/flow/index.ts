@@ -36,6 +36,7 @@ export type {
 	IdempotencyClass,
 	StepMeta,
 	StepOutcome,
+	StepRunContext,
 	StepTag,
 } from './step.js';
 export {

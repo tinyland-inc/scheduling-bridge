@@ -16,7 +16,7 @@
  * by |nodes| x (1 + sum of maxReentries over recovery edges).
  */
 
-import { Data, Effect, Schedule, type Layer, type Scope } from 'effect';
+import { Data, Effect, Schedule, Schema, type Layer, type Scope } from 'effect';
 import type { FlowStateSpec, StateOf } from './state.js';
 import type { Flow } from './flow.js';
 import type { FlowPlanNode } from './plan.js';
@@ -31,7 +31,11 @@ export class FlowDivergedError extends Data.TaggedError('FlowDivergedError')<{
 }> {}
 
 export class FlowRunError extends Data.TaggedError('FlowRunError')<{
-	readonly code: 'MISSING_NEED' | 'UNKNOWN_STEP' | 'TERMINATION_BOUND_EXCEEDED';
+	readonly code:
+		| 'MISSING_NEED'
+		| 'UNKNOWN_STEP'
+		| 'TERMINATION_BOUND_EXCEEDED'
+		| 'EFFECTFUL_ONCE_REPLAY';
 	readonly message: string;
 }> {}
 
@@ -41,6 +45,18 @@ export interface RunFlowOptions<RS = never, ES = never, RIn = never> {
 	/** Session layer provided once per segment Scope region. The caller decides
 	 * BrowserSessionLive vs another layer (e.g. Layer.empty for REST flows) — never hardcoded. */
 	readonly sessionLayer: (segment: string) => Layer.Layer<RS, ES, RIn>;
+	/**
+	 * Segment-replay resume (design §5 "Resume = replay at segment boundaries").
+	 * When true AND the journal already has rows for this operationId (a re-lease),
+	 * the fold decodes the last segment-boundary `stateDelta` checkpoint, emits
+	 * `skipped_resume` rows for the prior segments' nodes, seeds journaled
+	 * idempotency tokens and attempt counters, and re-runs the open segment from its
+	 * head — honoring idempotency classes: any journaled execution evidence on an
+	 * effectful-once node that would be re-run fails with `EFFECTFUL_ONCE_REPLAY`
+	 * (never silent re-submit; the worker's confirmation-probe gate sits in front).
+	 * Default false: behavior is byte-identical to the pre-resume fold.
+	 */
+	readonly resume?: boolean;
 }
 
 type NodeResult = { readonly kind: 'advance' } | { readonly kind: 'reroute'; readonly to: number };
@@ -76,6 +92,8 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 			if (last && last.segment === nodes[i].segment) last.end = i;
 			else segments.push({ segment: nodes[i].segment, start: i, end: i });
 		}
+		// Segment-boundary node indexes: the ONLY checkpoints that carry stateDelta (design §5).
+		const segmentEnds = new Set(segments.map((segment) => segment.end));
 
 		// Re-entry budgets per declared recovery edge; their sum bounds the unrolling.
 		const budgets = new Map<string, number>();
@@ -89,6 +107,8 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 		const executionBound = nodes.length * (1 + budgetSum);
 
 		const state: Record<string, unknown> = { ...(initial as Record<string, unknown>) };
+		/** Keys provided by steps so far (initial keys excluded): the stateDelta vocabulary. */
+		const providedKeys = new Set<string>();
 		const attempts = new Map<string, number>();
 		const tokens = new Map<string, string>();
 		const succeeded: {
@@ -124,6 +144,52 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 						Effect.logWarning('flow journal append failed (evidence-only; continuing)', error),
 					),
 				);
+
+		/**
+		 * Schema-ENCODE the accumulated Provides state (design §5: "`stateDelta` is
+		 * journaled only at segment boundaries"). Cumulative over provided keys —
+		 * never initial keys — so the LAST boundary row alone reconstructs everything
+		 * prior segments provided. Evidence-only: encode failure logs and omits the
+		 * delta (resume then safely falls back to a full re-run).
+		 */
+		const encodeProvidedState = (): Effect.Effect<Record<string, unknown> | undefined> =>
+			Effect.gen(function* () {
+				const entries: [string, unknown][] = [];
+				for (const key of providedKeys) {
+					const schema = flow.spec[key];
+					if (!schema) continue;
+					entries.push([key, yield* Schema.encodeUnknown(schema)(state[key])]);
+				}
+				return Object.fromEntries(entries) as Record<string, unknown>;
+			}).pipe(
+				Effect.catchAll((error) =>
+					Effect.logWarning(
+						'flow stateDelta encode failed (evidence-only; continuing without delta)',
+						error,
+					).pipe(Effect.as(undefined)),
+				),
+			);
+
+		/** Decode a journaled segment-boundary stateDelta back through the state schemas. */
+		const decodeStateDelta = (
+			delta: Record<string, unknown>,
+		): Effect.Effect<Record<string, unknown> | undefined> =>
+			Effect.gen(function* () {
+				const entries: [string, unknown][] = [];
+				for (const [key, encoded] of Object.entries(delta)) {
+					const schema = flow.spec[key];
+					if (!schema) continue;
+					entries.push([key, yield* Schema.decodeUnknown(schema)(encoded)]);
+				}
+				return Object.fromEntries(entries) as Record<string, unknown>;
+			}).pipe(
+				Effect.catchAll((error) =>
+					Effect.logWarning(
+						'flow stateDelta decode failed; resuming via full re-run',
+						error,
+					).pipe(Effect.as(undefined)),
+				),
+			);
 
 		const classify = (node: FlowPlanNode, observed: LandingObservation | undefined): LandingOutcome => {
 			if (!observed) {
@@ -186,8 +252,14 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 				const knownToken = tokens.get(node.stepId);
 				yield* checkpoint(node.stepId, attempt, 'started', knownToken ? { idempotencyToken: knownToken } : {});
 
+				// Thread the known (re-attached or journal-seeded) token back into the step
+				// (design §5: a retried payment-injection segment reuses the journaled
+				// idempotencyToken instead of minting another).
 				const outcome = (yield* Effect.retry(
-					step.run(input as never) as Effect.Effect<unknown, unknown, unknown>,
+					step.run(
+						input as never,
+						knownToken !== undefined ? { idempotencyToken: knownToken } : undefined,
+					) as Effect.Effect<unknown, unknown, unknown>,
 					(step.meta.retry ?? Schedule.stop) as Schedule.Schedule<unknown, unknown>,
 				).pipe(
 					Effect.tapError((error) =>
@@ -226,12 +298,16 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 					return { kind: 'reroute', to: indexOf.get(landing.rerouteTo) as number } as NodeResult;
 				}
 
+				Object.assign(state, outcome.state);
+				for (const key of node.provides) providedKeys.add(key);
+				// Segment-boundary checkpoint: the ONLY rows carrying Schema-encoded state.
+				const stateDelta = segmentEnds.has(index) ? yield* encodeProvidedState() : undefined;
 				yield* checkpoint(node.stepId, attempt, 'completed', {
 					...(outcome.observed ? { landing: outcome.observed } : {}),
 					...(outcome.resolutions ? { resolutions: outcome.resolutions } : {}),
 					...(outcome.idempotencyToken !== undefined ? { idempotencyToken: outcome.idempotencyToken } : {}),
+					...(stateDelta !== undefined ? { stateDelta } : {}),
 				});
-				Object.assign(state, outcome.state);
 				succeeded.push({
 					stepId: node.stepId,
 					output: outcome.state as Record<string, unknown>,
@@ -259,8 +335,70 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 				return { kind: 'advance' } as NodeResult;
 			});
 
+		// =====================================================================
+		// RESUME HYDRATION (design §5 "Resume = replay at segment boundaries"):
+		// only on an explicit re-lease path (options.resume) and only when the
+		// journal already has rows for this operation. Browser state is not
+		// serializable — prior segments are SKIPPED (their Provides decoded from
+		// the last segment-boundary stateDelta), the open segment re-runs from
+		// its head. Idempotency classes gate the re-run: read/replayable-write
+		// re-drive freely; any journaled execution evidence on an effectful-once
+		// node ahead of the boundary refuses with EFFECTFUL_ONCE_REPLAY (never
+		// silent re-submit — the worker's confirmation probe owns that decision).
+		// =====================================================================
+		let startIndex = 0;
+		if (options.resume) {
+			const rows = yield* journal.read(options.operationId).pipe(
+				Effect.catchAll((error) =>
+					Effect.logWarning(
+						'flow journal read failed on resume; re-running from the head',
+						error,
+					).pipe(Effect.as([] as readonly FlowCheckpoint[])),
+				),
+			);
+			if (rows.length > 0) {
+				// Seed journaled idempotency tokens and attempt counters (cross-lease
+				// continuation of the in-run re-attach semantics).
+				for (const row of rows) {
+					if (row.idempotencyToken !== undefined) tokens.set(row.stepId, row.idempotencyToken);
+					if (row.attempt > (attempts.get(row.stepId) ?? 0)) attempts.set(row.stepId, row.attempt);
+				}
+				// The last segment-boundary checkpoint (completed row carrying stateDelta
+				// on a plan segment-end node — defensively ignore anything else).
+				let boundary: FlowCheckpoint | undefined;
+				for (const row of rows) {
+					if (row.status !== 'completed' || row.stateDelta === undefined) continue;
+					const index = indexOf.get(row.stepId);
+					if (index !== undefined && segmentEnds.has(index)) boundary = row;
+				}
+				if (boundary?.stateDelta) {
+					const decoded = yield* decodeStateDelta(boundary.stateDelta);
+					if (decoded) {
+						Object.assign(state, decoded);
+						for (const key of Object.keys(decoded)) providedKeys.add(key);
+						startIndex = (indexOf.get(boundary.stepId) as number) + 1;
+						for (let i = 0; i < startIndex; i += 1) {
+							yield* checkpoint(nodes[i].stepId, attempts.get(nodes[i].stepId) ?? 1, 'skipped_resume');
+						}
+					}
+				}
+				for (let i = startIndex; i < nodes.length; i += 1) {
+					const node = nodes[i];
+					if (node.idempotency !== 'effectful-once') continue;
+					if (rows.some((row) => row.stepId === node.stepId && (row.status === 'started' || row.status === 'completed'))) {
+						return yield* Effect.fail(
+							new FlowRunError({
+								code: 'EFFECTFUL_ONCE_REPLAY',
+								message: `resume would re-run effectful-once step '${node.stepId}' which already has journaled execution evidence`,
+							}),
+						);
+					}
+				}
+			}
+		}
+
 		const execute = Effect.gen(function* () {
-			let index = 0;
+			let index = startIndex;
 			while (index < nodes.length) {
 				const segIndex = segments.findIndex((s) => index >= s.start && index <= s.end);
 				const segment = segments[segIndex];

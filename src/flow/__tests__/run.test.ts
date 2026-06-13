@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Cause, Context, Effect, Exit, Layer, Option, Schedule } from 'effect';
 import { makeFlow } from '../flow.js';
 import { FlowJournal, JournalError, createInMemoryFlowJournal, type FlowJournalShape } from '../journal.js';
-import { FlowDivergedError, runFlow } from '../run.js';
+import { FlowDivergedError, FlowRunError, runFlow } from '../run.js';
 import { makeStep, observation, spec } from './helpers.js';
 
 const identity = { flowId: 'booking_create_with_payment', backend: 'acuity', version: '1.0.0' } as const;
@@ -593,5 +593,378 @@ describe('runFlow', () => {
 		expect(builds).toBe(2);
 		expect(seen.a1).toBe(seen.a2);
 		expect(seen.b1).not.toBe(seen.a1);
+	});
+});
+
+// =============================================================================
+// SEGMENT-BOUNDARY stateDelta + SEGMENT-REPLAY RESUME (design §5 "Checkpoint
+// persistence discipline" / "Resume = replay at segment boundaries")
+// =============================================================================
+
+describe('runFlow stateDelta at segment boundaries', () => {
+	it('journals Schema-encoded Provides state on segment-boundary completed rows only', async () => {
+		const journal = createInMemoryFlowJournal();
+		const flow = makeFlow(spec, ['bookingRef'])
+			.add(
+				makeStep({
+					id: 'a1',
+					needs: ['bookingRef'],
+					provides: ['navResult'],
+					segment: 'seg-a',
+					run: (input) => Effect.succeed({ state: { navResult: `nav:${input.bookingRef}` } }),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 'a2',
+					needs: ['navResult'],
+					provides: ['formResult'],
+					segment: 'seg-a',
+					run: () => Effect.succeed({ state: { formResult: 'form-ok' } }),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 'b1',
+					needs: ['formResult'],
+					provides: ['confirmation'],
+					segment: 'seg-b',
+					run: () => Effect.succeed({ state: { confirmation: 'confirmed' } }),
+				}),
+			)
+			.build(identity);
+
+		await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-1' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		const byStep = (stepId: string, status: string) =>
+			rows.find((r) => r.stepId === stepId && r.status === status);
+
+		// Mid-segment completed rows carry NO stateDelta; boundary rows do.
+		expect(byStep('a1', 'completed')?.stateDelta).toBeUndefined();
+		expect(byStep('a2', 'completed')?.stateDelta).toEqual({
+			navResult: 'nav:ref-1',
+			formResult: 'form-ok',
+		});
+		// Boundary deltas are cumulative over PROVIDED keys (the last boundary alone
+		// reconstructs everything) and never include initial keys.
+		expect(byStep('b1', 'completed')?.stateDelta).toEqual({
+			navResult: 'nav:ref-1',
+			formResult: 'form-ok',
+			confirmation: 'confirmed',
+		});
+		expect(
+			rows.every((r) => r.stateDelta === undefined || !('bookingRef' in r.stateDelta)),
+		).toBe(true);
+		expect(rows.filter((r) => r.status === 'started').every((r) => r.stateDelta === undefined)).toBe(true);
+	});
+});
+
+describe('runFlow segment-replay resume (options.resume)', () => {
+	/** Two-segment flow with per-step run counters; seg-b has two steps so the
+	 * open-segment-from-its-head replay is observable (b1 must re-run, a1 must not). */
+	const makeResumableFlow = (counters: Record<string, number>, failB2First: { fail: boolean }) =>
+		makeFlow(spec, ['bookingRef'])
+			.add(
+				makeStep({
+					id: 'a1',
+					needs: ['bookingRef'],
+					provides: ['navResult'],
+					segment: 'seg-a',
+					run: (input) =>
+						Effect.suspend(() => {
+							counters.a1 = (counters.a1 ?? 0) + 1;
+							return Effect.succeed({ state: { navResult: `nav:${input.bookingRef}` } });
+						}),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 'b1',
+					needs: ['navResult'],
+					provides: ['formResult'],
+					segment: 'seg-b',
+					run: (input) =>
+						Effect.suspend(() => {
+							counters.b1 = (counters.b1 ?? 0) + 1;
+							return Effect.succeed({ state: { formResult: `form:${input.navResult}` } });
+						}),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 'b2',
+					needs: ['formResult'],
+					provides: ['confirmation'],
+					segment: 'seg-b',
+					run: () =>
+						Effect.suspend(() => {
+							counters.b2 = (counters.b2 ?? 0) + 1;
+							return failB2First.fail
+								? Effect.fail(new StepFailure('b2 boom'))
+								: Effect.succeed({ state: { confirmation: 'confirmed' } });
+						}),
+				}),
+			)
+			.build(identity);
+
+	it('skips completed segments via skipped_resume rows, decodes the boundary state, and re-runs the open segment from its head', async () => {
+		const journal = createInMemoryFlowJournal();
+		const counters: Record<string, number> = {};
+		const gate = { fail: true };
+		const flow = makeResumableFlow(counters, gate);
+
+		// Lease 1: seg-a completes (boundary journaled), seg-b dies at b2.
+		const first = await Effect.runPromiseExit(
+			runFlow(flow, { bookingRef: 'ref-7' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(Exit.isFailure(first)).toBe(true);
+		expect(counters).toEqual({ a1: 1, b1: 1, b2: 1 });
+		const firstRowCount = (await Effect.runPromise(journal.read('op-1'))).length;
+
+		// Lease 2 (resume): b2 now succeeds.
+		gate.fail = false;
+		const outcome = await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-7' }, { ...options, resume: true }).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+
+		// a1 was skipped (decoded from the boundary stateDelta); seg-b re-ran from its head.
+		expect(counters).toEqual({ a1: 1, b1: 2, b2: 2 });
+		expect(outcome.landed).toBe('intended-terminal');
+		expect(outcome.output.navResult).toBe('nav:ref-7');
+		expect(outcome.output.formResult).toBe('form:nav:ref-7');
+		expect(outcome.output.confirmation).toBe('confirmed');
+
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		expect(rows.slice(firstRowCount).map((r) => [r.stepId, r.status, r.attempt])).toEqual([
+			['a1', 'skipped_resume', 1],
+			['b1', 'started', 2],
+			['b1', 'completed', 2],
+			['b2', 'started', 2],
+			['b2', 'completed', 2],
+		]);
+		// The resumed run's boundary row re-encodes the cumulative provides.
+		const finalBoundary = rows[rows.length - 1];
+		expect(finalBoundary.stateDelta).toEqual({
+			navResult: 'nav:ref-7',
+			formResult: 'form:nav:ref-7',
+			confirmation: 'confirmed',
+		});
+	});
+
+	it('re-runs from the head (no skipped_resume rows) when no segment boundary was journaled', async () => {
+		const journal = createInMemoryFlowJournal();
+		let runs = 0;
+		const flow = makeFlow(spec)
+			.add(
+				makeStep({
+					id: 'only',
+					needs: [],
+					provides: ['navResult'],
+					idempotency: 'read',
+					run: () =>
+						Effect.suspend(() => {
+							runs += 1;
+							return runs === 1
+								? Effect.fail(new StepFailure('first lease boom'))
+								: Effect.succeed({ state: { navResult: 'ok' } });
+						}),
+				}),
+			)
+			.build(identity);
+
+		const first = await Effect.runPromiseExit(
+			runFlow(flow, {}, options).pipe(Effect.provideService(FlowJournal, journal)),
+		);
+		expect(Exit.isFailure(first)).toBe(true);
+
+		const outcome = await Effect.runPromise(
+			runFlow(flow, {}, { ...options, resume: true }).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(runs).toBe(2);
+		expect(outcome.output.navResult).toBe('ok');
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		expect(rows.some((r) => r.status === 'skipped_resume')).toBe(false);
+		// Attempt numbering continues across leases (journal-seeded).
+		expect(rows.map((r) => [r.status, r.attempt])).toEqual([
+			['started', 1],
+			['failed', 1],
+			['started', 2],
+			['completed', 2],
+		]);
+	});
+
+	it('replays a fully-completed journal without re-running any step', async () => {
+		const journal = createInMemoryFlowJournal();
+		const counters: Record<string, number> = {};
+		const flow = makeResumableFlow(counters, { fail: false });
+
+		await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-2' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(counters).toEqual({ a1: 1, b1: 1, b2: 1 });
+
+		const outcome = await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-2' }, { ...options, resume: true }).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		// Nothing re-ran; every node got a skipped_resume row; output decoded from the journal.
+		expect(counters).toEqual({ a1: 1, b1: 1, b2: 1 });
+		expect(outcome.landed).toBe('intended-terminal');
+		expect(outcome.output.confirmation).toBe('confirmed');
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		expect(rows.slice(-3).map((r) => [r.stepId, r.status])).toEqual([
+			['a1', 'skipped_resume'],
+			['b1', 'skipped_resume'],
+			['b2', 'skipped_resume'],
+		]);
+	});
+
+	it('threads the journaled idempotencyToken back into the re-run step (design §5 token reuse)', async () => {
+		const journal = createInMemoryFlowJournal();
+		const seenContexts: (string | undefined)[] = [];
+		let mints = 0;
+		let failT2 = true;
+		const flow = makeFlow(spec)
+			.add(
+				makeStep({
+					id: 'payment/apply-coupon',
+					needs: [],
+					provides: ['navResult'],
+					run: (_input, context) =>
+						Effect.suspend(() => {
+							seenContexts.push(context?.idempotencyToken);
+							const token =
+								context?.idempotencyToken ??
+								(() => {
+									mints += 1;
+									return `MINTED-${mints}`;
+								})();
+							return Effect.succeed({ state: { navResult: 'ok' }, idempotencyToken: token });
+						}),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 't2',
+					needs: ['navResult'],
+					provides: ['formResult'],
+					run: () =>
+						Effect.suspend(() =>
+							failT2
+								? Effect.fail(new StepFailure('t2 boom'))
+								: Effect.succeed({ state: { formResult: 'ok' } }),
+						),
+				}),
+			)
+			.build(identity);
+
+		// Lease 1: the payment step mints and journals its token; the segment dies at t2
+		// (same segment ⇒ no boundary ⇒ the whole segment re-runs on resume).
+		const first = await Effect.runPromiseExit(
+			runFlow(flow, {}, options).pipe(Effect.provideService(FlowJournal, journal)),
+		);
+		expect(Exit.isFailure(first)).toBe(true);
+		expect(seenContexts).toEqual([undefined]);
+		expect(mints).toBe(1);
+
+		// Lease 2 (resume): the journaled token is threaded back in — no second mint.
+		failT2 = false;
+		await Effect.runPromise(
+			runFlow(flow, {}, { ...options, resume: true }).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(seenContexts).toEqual([undefined, 'MINTED-1']);
+		expect(mints).toBe(1);
+
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		const resumedStarted = rows.filter(
+			(r) => r.stepId === 'payment/apply-coupon' && r.status === 'started' && r.attempt === 2,
+		);
+		expect(resumedStarted).toHaveLength(1);
+		expect(resumedStarted[0].idempotencyToken).toBe('MINTED-1');
+	});
+
+	it('refuses to re-run an effectful-once step with journaled execution evidence (EFFECTFUL_ONCE_REPLAY)', async () => {
+		const journal = createInMemoryFlowJournal();
+		let submits = 0;
+		const flow = makeFlow(spec, ['bookingRef'])
+			.add(
+				makeStep({
+					id: 'a1',
+					needs: ['bookingRef'],
+					provides: ['navResult'],
+					segment: 'seg-a',
+					run: () => Effect.succeed({ state: { navResult: 'ok' } }),
+				}),
+			)
+			.add(
+				makeStep({
+					id: 'submit',
+					needs: ['navResult'],
+					provides: ['formResult'],
+					segment: 'seg-b',
+					idempotency: 'effectful-once',
+					run: () =>
+						Effect.suspend(() => {
+							submits += 1;
+							return Effect.fail(new StepFailure('died mid-submit'));
+						}),
+				}),
+			)
+			.build(identity);
+
+		const first = await Effect.runPromiseExit(
+			runFlow(flow, { bookingRef: 'ref-3' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(Exit.isFailure(first)).toBe(true);
+		expect(submits).toBe(1);
+
+		const second = await Effect.runPromiseExit(
+			runFlow(flow, { bookingRef: 'ref-3' }, { ...options, resume: true }).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		const error = failureOf(second);
+		expect(error).toBeInstanceOf(FlowRunError);
+		expect((error as FlowRunError).code).toBe('EFFECTFUL_ONCE_REPLAY');
+		// The submit step was NEVER silently re-run.
+		expect(submits).toBe(1);
+	});
+
+	it('without options.resume, existing journal rows are ignored (default behavior unchanged)', async () => {
+		const journal = createInMemoryFlowJournal();
+		const counters: Record<string, number> = {};
+		const flow = makeResumableFlow(counters, { fail: false });
+
+		await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-4' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		await Effect.runPromise(
+			runFlow(flow, { bookingRef: 'ref-4' }, options).pipe(
+				Effect.provideService(FlowJournal, journal),
+			),
+		);
+		expect(counters).toEqual({ a1: 2, b1: 2, b2: 2 });
+		const rows = await Effect.runPromise(journal.read('op-1'));
+		expect(rows.some((r) => r.status === 'skipped_resume')).toBe(false);
 	});
 });

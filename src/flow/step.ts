@@ -56,6 +56,17 @@ export interface StepOutcome<Spec extends FlowStateSpec, Provides extends keyof 
 	readonly idempotencyToken?: string;
 }
 
+/**
+ * Per-attempt execution context the fold threads into `run` (design §5 idempotency:
+ * "a retried payment-injection segment reuses the journaled `idempotencyToken` …
+ * instead of minting another"). Additive and optional — steps that mint nothing
+ * ignore it; steps that mint MUST prefer `idempotencyToken` when present.
+ */
+export interface StepRunContext {
+	/** Token minted by a prior attempt (re-attached in-run, or journal-seeded on resume). */
+	readonly idempotencyToken?: string;
+}
+
 export interface FlowStep<
 	Spec extends FlowStateSpec,
 	Needs extends keyof Spec & string,
@@ -66,6 +77,7 @@ export interface FlowStep<
 	readonly meta: StepMeta<Spec, Needs, Provides>;
 	readonly run: (
 		input: Pick<StateOf<Spec>, Needs>,
+		context?: StepRunContext,
 	) => Effect.Effect<StepOutcome<Spec, Provides>, E, R>;
 	/** Vendor-side cleanup only (e.g. admin-API cancel). NEVER payment refunds — kit's
 	 * pipeline owns those (kit src/core/pipelines.ts:89). */

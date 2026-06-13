@@ -33,14 +33,18 @@ import {
 import {
 	FlowDivergedError,
 	FlowJournal,
+	FlowRunError,
 	createInMemoryFlowJournal,
 	createPostgresFlowJournal,
 	createRedisFlowJournal,
 	parseFlowJournalTtlSeconds,
 	runFlow,
 	type Flow,
+	type FlowCheckpoint,
 	type FlowJournalShape,
 	type FlowOutcome,
+	type FlowPlanNode,
+	type LandingObservation,
 } from '../flow/index.js';
 import type { StateOf } from '../flow/state.js';
 
@@ -168,6 +172,20 @@ export const flowCauseToExecutionError = (
 	const error = failure._tag === 'Some' ? failure.value : undefined;
 
 	if (error instanceof BridgeJobExecutionError) return error;
+
+	// The fold's resume-side idempotency backstop (design §5: a `started`
+	// checkpoint without `completed` on an effectful-once step hard-maps to
+	// reconcile_required — never silent re-submit). The confirmation-probe gate
+	// normally intercepts before runFlow; this mapping covers any other entry.
+	if (error instanceof FlowRunError && error.code === 'EFFECTFUL_ONCE_REPLAY') {
+		return new BridgeJobExecutionError({
+			status: 'reconcile_required',
+			code: 'EFFECTFUL_ONCE_REPLAY',
+			message: error.message,
+			step: legacyStepLabel(lastStartedStepId) ?? 'flow-resume',
+			retryable: false,
+		});
+	}
 
 	if (error instanceof FlowDivergedError) {
 		if (error.stepId === 'acuity/bypass-payment') {
@@ -313,11 +331,13 @@ const runFlowToOutcome = async <Spec extends Record<string, any>>(
 	flow: Flow<any, MiddlewareError | undefined, any>,
 	initial: Record<string, unknown>,
 	operationId: string,
+	resume = false,
 ): Promise<FlowOutcome<Partial<StateOf<Spec>>>> => {
 	const trace = { lastStarted: undefined as string | undefined };
 	const effect = runFlow(flow as Flow<Spec, MiddlewareError | undefined, any>, initial as never, {
 		operationId,
 		sessionLayer: deps.sessionLayer,
+		resume,
 	}).pipe(
 		Effect.provideService(FlowJournal, traceJournal(deps.journal, trace)),
 	) as unknown as Effect.Effect<unknown, unknown, never>;
@@ -328,12 +348,180 @@ const runFlowToOutcome = async <Spec extends Record<string, any>>(
 	return exit.value as FlowOutcome<Partial<StateOf<Spec>>>;
 };
 
+// =============================================================================
+// CONFIRMATION-PROBE GATE (design §5 idempotency, the resume side of
+// effectful-once: "Resume of a booking flow first runs a cheap
+// extractConfirmation probe: confirmation found ⇒ succeeded; ambiguous ⇒
+// reconcile_required with the step trace, landing observation, and evidence
+// attached" — NEVER silent re-submit)
+// =============================================================================
+
+const describeProbeError = (error: unknown): string => {
+	if (typeof error === 'object' && error !== null) {
+		const maybe = error as { _tag?: string; message?: string };
+		return `${maybe._tag ?? 'UNKNOWN'}: ${maybe.message ?? JSON.stringify(error)}`;
+	}
+	return String(error);
+};
+
+const maxJournaledAttempt = (
+	rows: readonly FlowCheckpoint[],
+	stepId: string,
+): number =>
+	rows.reduce(
+		(max, row) => (row.stepId === stepId && row.attempt > max ? row.attempt : max),
+		1,
+	);
+
+/** Evidence-only journal append: a failed write never changes the gate's verdict. */
+const appendEvidence = async (
+	journal: FlowJournalShape,
+	cp: Omit<FlowCheckpoint, 'seq'>,
+): Promise<void> => {
+	await Effect.runPromise(journal.append(cp)).catch(() => undefined);
+};
+
+/**
+ * Resolve a started-without-completed effectful-once checkpoint WITHOUT re-running
+ * the effectful step: run the first read-class plan node after it (for the Acuity
+ * booking flow, `acuity/extract-confirmation`) standalone in its own segment Scope.
+ * Confirmation found ⇒ the booking succeeded — return it with the extracted data.
+ * Anything else is ambiguous ⇒ reconcile_required carrying the journal step trace,
+ * the landing observation, and the probe evidence. The submit step is never re-run.
+ */
+const probeConfirmationGate = async (
+	deps: FlowExecutionDeps,
+	flow: Flow<AcuityBookingFlowSpec, MiddlewareError | undefined, any>,
+	command: AppointmentCommand,
+	initial: Record<string, unknown>,
+	rows: readonly FlowCheckpoint[],
+	pending: FlowPlanNode,
+	operationId: string,
+): Promise<Booking> => {
+	const trace = rows.map((row) => `${row.stepId}:${row.status}`).join(' -> ');
+
+	const reconcile = (detail: string, landing?: LandingObservation): BridgeJobExecutionError =>
+		new BridgeJobExecutionError({
+			status: 'reconcile_required',
+			code: 'CONFIRMATION_PROBE_AMBIGUOUS',
+			message:
+				`Effectful-once step '${pending.stepId}' has a started-without-completed checkpoint and was NOT re-run; ${detail}` +
+				(landing
+					? `; landing: observed '${landing.observed}', expected [${landing.expected.join(', ')}]`
+					: '') +
+				`; journal trace: ${trace}`,
+			step: legacyStepLabel(pending.stepId),
+			retryable: false,
+		});
+
+	const pendingIndex = flow.plan.nodes.findIndex((node) => node.stepId === pending.stepId);
+	const probeNode = flow.plan.nodes
+		.slice(pendingIndex + 1)
+		.find((node) => node.idempotency === 'read');
+	const probeStep = probeNode ? flow.steps.get(probeNode.stepId) : undefined;
+	if (!probeNode || !probeStep) {
+		throw reconcile('no read-class confirmation-probe step exists after it');
+	}
+
+	// Best-effort probe input: initial command state + journaled segment-boundary
+	// deltas (the probe step is read-class and self-contained; absent needs stay absent).
+	const merged: Record<string, unknown> = { ...initial };
+	for (const row of rows) {
+		if (row.stateDelta) Object.assign(merged, row.stateDelta);
+	}
+	const input = Object.fromEntries(probeNode.needs.map((key) => [key, merged[key]]));
+
+	const exit = await deps.runExit(
+		Effect.scoped(
+			Effect.provide(
+				probeStep.run(input as never) as Effect.Effect<unknown, unknown, any>,
+				deps.sessionLayer(probeNode.segment) as Layer.Layer<any, any, any>,
+			),
+		) as unknown as Effect.Effect<unknown, unknown, never>,
+	);
+
+	const evidenceBase = {
+		operationId,
+		flowId: flow.plan.flowId,
+		flowVersion: flow.plan.version,
+		planHash: flow.planHash,
+	};
+
+	if (Exit.isSuccess(exit)) {
+		const outcome = exit.value as {
+			readonly state?: Record<string, unknown>;
+			readonly observed?: LandingObservation;
+		};
+		const confirmation = outcome.state?.confirmation;
+		if (confirmation) {
+			// Confirmation found ⇒ the effectful-once step DID land; journal the
+			// resolution (evidence-only) and surface the booking as succeeded.
+			await appendEvidence(deps.journal, {
+				...evidenceBase,
+				stepId: pending.stepId,
+				attempt: maxJournaledAttempt(rows, pending.stepId),
+				status: 'completed',
+				at: new Date().toISOString(),
+				...(outcome.observed ? { landing: outcome.observed } : {}),
+			});
+			await appendEvidence(deps.journal, {
+				...evidenceBase,
+				stepId: probeNode.stepId,
+				attempt: maxJournaledAttempt(rows, probeNode.stepId),
+				status: 'completed',
+				at: new Date().toISOString(),
+				...(outcome.observed ? { landing: outcome.observed } : {}),
+			});
+			return toBooking(
+				confirmation as ConfirmationData,
+				command.request,
+				command.paymentRef,
+				command.paymentProcessor,
+			);
+		}
+		const landing: LandingObservation = outcome.observed ?? {
+			expected: probeNode.expects,
+			observed: 'unknown',
+			confidence: 0,
+			evidence: [],
+		};
+		throw reconcile('the confirmation probe returned no confirmation state', landing);
+	}
+
+	const failure = Cause.failureOption(exit.cause);
+	const detail =
+		failure._tag === 'Some'
+			? describeProbeError(failure.value)
+			: Cause.pretty(exit.cause);
+	const landing: LandingObservation = {
+		expected: probeNode.expects,
+		observed: 'unknown',
+		confidence: 0,
+		evidence: [],
+	};
+	await appendEvidence(deps.journal, {
+		...evidenceBase,
+		stepId: probeNode.stepId,
+		attempt: maxJournaledAttempt(rows, probeNode.stepId),
+		status: 'failed',
+		at: new Date().toISOString(),
+		landing,
+		error: { code: 'CONFIRMATION_PROBE_AMBIGUOUS', message: detail, retryable: false },
+	});
+	throw reconcile(`the confirmation probe ('${probeNode.stepId}') could not verify the outcome (${detail})`, landing);
+};
+
 /**
  * The flagged booking execution: the production worker's step sequence through the
  * fold, with the bypass-proof boundary (Diverged on the payment-injection step ⇒
  * PAYMENT_BYPASS_NOT_PROVEN) and the reconcile_required mapping preserved. The
  * REST-path and coupon guards stay in the executor (src/server/worker.ts) so their
  * legacy codes are byte-identical.
+ *
+ * Re-lease order (design §5): skew check first (FLOW_PLAN_SKEW semantics are
+ * pinned), then the confirmation-probe gate when an effectful-once step has a
+ * started-without-completed checkpoint (never reaches runFlow ⇒ never re-submits),
+ * then segment-replay resume through the fold.
  */
 export const executeBookingThroughFlow = async (
 	deps: FlowExecutionDeps,
@@ -343,19 +531,40 @@ export const executeBookingThroughFlow = async (
 	context: BridgeJobLeaseContext | undefined,
 ): Promise<Booking> => {
 	await checkFlowPlanSkew(flow, deps.journal, context);
+	const operationId = context?.operationId ?? randomUUID();
+	const initial: Record<string, unknown> = {
+		serviceId: command.request.serviceId,
+		datetime: command.request.datetime,
+		serviceName: command.serviceName ?? null,
+		client: toClientState(command.request.client),
+		couponCode,
+		paymentRef: command.paymentRef,
+		paymentProcessor: command.paymentProcessor,
+	};
+
+	// Confirmation-probe gate (the resume side of effectful-once). Journal read is
+	// evidence-tolerant: an unreadable journal degrades to a normal (resume-aware) run.
+	const rows: readonly FlowCheckpoint[] = context?.operationId
+		? await Effect.runPromise(deps.journal.read(context.operationId)).catch(
+				() => [] as const,
+			)
+		: [];
+	const pending = flow.plan.nodes.find(
+		(node) =>
+			node.idempotency === 'effectful-once' &&
+			rows.some((row) => row.stepId === node.stepId && row.status === 'started') &&
+			!rows.some((row) => row.stepId === node.stepId && row.status === 'completed'),
+	);
+	if (pending) {
+		return probeConfirmationGate(deps, flow, command, initial, rows, pending, operationId);
+	}
+
 	const outcome = await runFlowToOutcome<AcuityBookingFlowSpec>(
 		deps,
 		flow,
-		{
-			serviceId: command.request.serviceId,
-			datetime: command.request.datetime,
-			serviceName: command.serviceName ?? null,
-			client: toClientState(command.request.client),
-			couponCode,
-			paymentRef: command.paymentRef,
-			paymentProcessor: command.paymentProcessor,
-		},
-		context?.operationId ?? randomUUID(),
+		initial,
+		operationId,
+		true,
 	);
 	const confirmation = outcome.output.confirmation;
 	if (!confirmation) {
@@ -379,6 +588,11 @@ export const executeBookingThroughFlow = async (
  * The flagged availability execution (dates or slots): the single self-navigating
  * read step through the fold. Failure parity: legacy `runWizardStep` maps any
  * refresh failure to retryable `failed_pre_submit` — so does this.
+ *
+ * Segment-replay resume (design §5): on re-lease of a job whose journal already
+ * has a segment-boundary checkpoint, prior segments are skipped (`skipped_resume`
+ * rows) and their Provides decoded from the journaled stateDelta; a journal with
+ * only failed attempts re-runs from the head (read steps re-run freely).
  */
 export const executeReadThroughFlow = async <A>(
 	deps: FlowExecutionDeps,
@@ -393,6 +607,7 @@ export const executeReadThroughFlow = async <A>(
 		flow,
 		initial,
 		context?.operationId ?? randomUUID(),
+		true,
 	);
 	return (outcome.output as Record<string, unknown>)[outputKey] as A;
 };

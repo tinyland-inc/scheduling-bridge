@@ -470,13 +470,14 @@ export const acuityBypassPaymentStep: BookingStep<
 		tags: ['payment-injection'],
 		selectorKeys: ['paymentCouponToggle', 'paymentCouponInput', 'paymentCouponApply'],
 	},
-	run: (input) =>
+	run: (input, context) =>
 		Effect.suspend(() => {
-			const token = generateCouponCode(
-				input.paymentRef,
-				input.paymentProcessor,
-				input.couponCode,
-			);
+			// A retried/resumed payment-injection segment reuses the journaled
+			// idempotencyToken (the coupon code) instead of minting another
+			// (design §5 replayable-write token reuse).
+			const token =
+				context?.idempotencyToken ??
+				generateCouponCode(input.paymentRef, input.paymentProcessor, input.couponCode);
 			return bypassPayment(token).pipe(
 				Effect.map((bypass) => {
 					const proven = isPaymentBypassProven(bypass);

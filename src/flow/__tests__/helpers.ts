@@ -3,7 +3,7 @@
  */
 
 import { Schema, type Effect, type Schedule } from 'effect';
-import type { FlowStep, IdempotencyClass, StepOutcome } from '../step.js';
+import type { FlowStep, IdempotencyClass, StepOutcome, StepRunContext } from '../step.js';
 import type { LandingObservation, StationId } from '../station.js';
 import type { StateOf } from '../state.js';
 
@@ -35,7 +35,10 @@ export const makeStep = <
 	readonly expects?: readonly StationId[];
 	readonly idempotency?: IdempotencyClass;
 	readonly retry?: Schedule.Schedule<unknown, unknown>;
-	readonly run: (input: Pick<StateOf<Spec>, N>) => Effect.Effect<StepOutcome<Spec, P>, E, R>;
+	readonly run: (
+		input: Pick<StateOf<Spec>, N>,
+		context?: StepRunContext,
+	) => Effect.Effect<StepOutcome<Spec, P>, E, R>;
 	readonly compensate?: (output: Pick<StateOf<Spec>, P>) => Effect.Effect<void, never, R>;
 }): FlowStep<Spec, N, P, E, R> => ({
 	meta: {

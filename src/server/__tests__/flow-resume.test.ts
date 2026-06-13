@@ -1,5 +1,5 @@
 /**
- * Re-lease resume semantics for the flagged worker path (TIN-2072; design §5
+ * Re-lease resume semantics for the worker path (TIN-2072; design §5
  * "Resume = replay at segment boundaries" / "Idempotency"):
  *
  * - READ flows: on re-lease of a job whose journal has rows, the fold decodes the
@@ -116,14 +116,13 @@ const bookingCommand = (couponCode?: string): AppointmentCommand => ({
 	executionPreference: 'auto',
 });
 
-const makeFlagged = () => {
+const makeExecutor = () => {
 	const journal = createInMemoryFlowJournal();
-	const flagged = createAcuityBridgeJobExecutor({
+	const executor = createAcuityBridgeJobExecutor({
 		redisClient: null,
-		flowRunner: true,
 		flowJournal: journal,
 	});
-	return { journal, flagged };
+	return { journal, executor };
 };
 
 const bookingFlow = acuityFlows.booking_create_with_payment;
@@ -220,19 +219,19 @@ beforeEach(() => {
 // READ-FLOW RESUME (segment replay; both availability flows)
 // =============================================================================
 
-describe('read-flow resume on re-lease (flag on)', () => {
+describe('read-flow resume on re-lease', () => {
 	it('replays a fully-journaled dates read from the boundary checkpoint without re-driving the browser', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const command = { serviceId: '53178494', month: '2026-06', adapterProfile };
 		const context = { operationId: 'op-dates-replay' };
 
-		const first = await flagged.refreshAvailabilityDates(command, context);
+		const first = await executor.refreshAvailabilityDates(command, context);
 		expect(first).toEqual([{ date: '2026-06-20', slots: 1 }]);
 		expect(stepMocks.readDatesViaUrl).toHaveBeenCalledTimes(1);
 
 		// Re-lease: the journaled segment boundary replays the output; the read
 		// step is NOT re-driven.
-		const second = await flagged.refreshAvailabilityDates(command, context);
+		const second = await executor.refreshAvailabilityDates(command, context);
 		expect(second).toEqual(first);
 		expect(stepMocks.readDatesViaUrl).toHaveBeenCalledTimes(1);
 
@@ -249,7 +248,7 @@ describe('read-flow resume on re-lease (flag on)', () => {
 	});
 
 	it('re-runs the open segment from its head after a failed lease (read steps re-run freely)', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const command = { serviceId: '53178494', date: '2026-06-15', adapterProfile };
 		const context = { operationId: 'op-slots-rerun' };
 
@@ -259,14 +258,14 @@ describe('read-flow resume on re-lease (flag on)', () => {
 			),
 		);
 		const error = await captureExecutionError(
-			flagged.refreshAvailabilitySlots(command, context),
+			executor.refreshAvailabilitySlots(command, context),
 		);
 		expect(error.status).toBe('failed_pre_submit');
 		expect(error.retryable).toBe(true);
 
 		// Re-lease: no segment boundary was journaled, so the segment re-runs from
 		// its head — full legacy-equivalent re-run, no skipped_resume rows.
-		const slots = await flagged.refreshAvailabilitySlots(command, context);
+		const slots = await executor.refreshAvailabilitySlots(command, context);
 		expect(slots).toEqual([{ datetime: '2026-06-15T16:00:00.000Z', available: true }]);
 		expect(stepMocks.readSlotsViaUrl).toHaveBeenCalledTimes(2);
 
@@ -285,16 +284,16 @@ describe('read-flow resume on re-lease (flag on)', () => {
 // BOOKING RESUME — segment replay (no effectful-once evidence)
 // =============================================================================
 
-describe('booking resume on re-lease (flag on, no effectful-once evidence)', () => {
+describe('booking resume on re-lease (no effectful-once evidence)', () => {
 	it('skips journaled segment boundaries and re-runs from the open segment', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const context = { executionPath: 'browser' as const, operationId: 'op-booking-resume' };
 
 		stepMocks.fillFormFields.mockReturnValueOnce(
 			Effect.fail(new WizardStepError({ step: 'fill-form', message: 'transient' })),
 		);
 		const error = await captureExecutionError(
-			flagged.createBookingWithPayment(bookingCommand('TEST-100'), context),
+			executor.createBookingWithPayment(bookingCommand('TEST-100'), context),
 		);
 		expect(error.status).toBe('failed_pre_submit');
 		expect(error.step).toBe('fill-form');
@@ -302,7 +301,7 @@ describe('booking resume on re-lease (flag on, no effectful-once evidence)', () 
 
 		// Re-lease: navigate's segment boundary is journaled — it is skipped; the
 		// open fill-form segment re-runs from its head and the flow completes.
-		const booking = await flagged.createBookingWithPayment(
+		const booking = await executor.createBookingWithPayment(
 			bookingCommand('TEST-100'),
 			context,
 		);
@@ -328,17 +327,17 @@ describe('booking resume on re-lease (flag on, no effectful-once evidence)', () 
 	});
 
 	it('a journal with no boundary degenerates to re-run-from-navigate (stated, not oversold)', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const context = { executionPath: 'browser' as const, operationId: 'op-booking-nav' };
 
 		stepMocks.navigateToBooking.mockReturnValueOnce(
 			Effect.fail(new WizardStepError({ step: 'navigate', message: 'transient' })),
 		);
 		await captureExecutionError(
-			flagged.createBookingWithPayment(bookingCommand('TEST-100'), context),
+			executor.createBookingWithPayment(bookingCommand('TEST-100'), context),
 		);
 
-		const booking = await flagged.createBookingWithPayment(
+		const booking = await executor.createBookingWithPayment(
 			bookingCommand('TEST-100'),
 			context,
 		);
@@ -354,7 +353,7 @@ describe('booking resume on re-lease (flag on, no effectful-once evidence)', () 
 // risk register #3: never silent re-submit)
 // =============================================================================
 
-describe('confirmation-probe gate on booking resume (flag on)', () => {
+describe('confirmation-probe gate on booking resume', () => {
 	const seedStartedSubmit = async (journal: FlowJournalShape, operationId: string) => {
 		await seedRow(journal, operationId, 'acuity/navigate', 'started');
 		await seedRow(journal, operationId, 'acuity/navigate', 'completed');
@@ -368,11 +367,11 @@ describe('confirmation-probe gate on booking resume (flag on)', () => {
 	};
 
 	it('confirmation found: marks the job succeeded with the extracted data and never re-runs submit', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const operationId = 'op-probe-found';
 		await seedStartedSubmit(journal, operationId);
 
-		const booking = await flagged.createBookingWithPayment(bookingCommand('TEST-100'), {
+		const booking = await executor.createBookingWithPayment(bookingCommand('TEST-100'), {
 			executionPath: 'browser',
 			operationId,
 		});
@@ -396,7 +395,7 @@ describe('confirmation-probe gate on booking resume (flag on)', () => {
 	});
 
 	it('ambiguous probe: reconcile_required with step trace, landing observation, and evidence — never re-submits', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const operationId = 'op-probe-ambiguous';
 		await seedStartedSubmit(journal, operationId);
 
@@ -407,7 +406,7 @@ describe('confirmation-probe gate on booking resume (flag on)', () => {
 		);
 
 		const error = await captureExecutionError(
-			flagged.createBookingWithPayment(bookingCommand('TEST-100'), {
+			executor.createBookingWithPayment(bookingCommand('TEST-100'), {
 				executionPath: 'browser',
 				operationId,
 			}),
@@ -478,9 +477,9 @@ describe('confirmation-probe gate on booking resume (flag on)', () => {
 // COUPON idempotencyToken REUSE (design §5 replayable-write token reuse)
 // =============================================================================
 
-describe('payment-injection token reuse on resume (flag on)', () => {
+describe('payment-injection token reuse on resume', () => {
 	it('threads the journaled coupon token back into the bypass step instead of minting', async () => {
-		const { journal, flagged } = makeFlagged();
+		const { journal, executor } = makeExecutor();
 		const operationId = 'op-token-reuse';
 		// An earlier lease journaled the bypass token but no segment boundary
 		// (boundary write lost): the bypass segment re-runs and MUST reuse the token.
@@ -488,7 +487,7 @@ describe('payment-injection token reuse on resume (flag on)', () => {
 			idempotencyToken: 'COUPON-X',
 		});
 
-		const booking = await flagged.createBookingWithPayment(bookingCommand('TEST-100'), {
+		const booking = await executor.createBookingWithPayment(bookingCommand('TEST-100'), {
 			executionPath: 'browser',
 			operationId,
 		});

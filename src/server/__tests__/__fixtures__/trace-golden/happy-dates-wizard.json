@@ -1,0 +1,21 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/read-dates:wizard",
+			"outcome": "ok"
+		}
+	],
+	"terminal": {
+		"status": "succeeded"
+	},
+	"result": [
+		{
+			"date": "2026-06-21",
+			"slots": 1
+		}
+	]
+}

@@ -1,0 +1,98 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/navigate",
+			"outcome": "error:WizardStepError"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/navigate",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/fill-form",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/bypass-payment",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/submit",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/extract-confirmation",
+			"outcome": "ok"
+		}
+	],
+	"transitions": [
+		{
+			"status": "failed_pre_submit",
+			"failure": {
+				"status": "failed_pre_submit",
+				"code": "SCRAPE_FAILED",
+				"step": "navigate",
+				"retryable": true,
+				"message": "Wizard step 'navigate' failed: transient nav failure"
+			}
+		},
+		{
+			"status": "queued"
+		},
+		{
+			"status": "succeeded",
+			"attempts": 2,
+			"result": {
+				"kind": "booking_create_with_payment",
+				"booking": {
+					"id": "apt_123",
+					"serviceId": "53178494",
+					"serviceName": "TMD single session",
+					"datetime": "2026-06-15T16:00:00.000Z",
+					"endTime": "2026-06-15T17:00:00.000Z",
+					"duration": 60,
+					"price": 0,
+					"currency": "USD",
+					"client": {
+						"firstName": "Jess",
+						"lastName": "Sullivan",
+						"email": "jess@example.com",
+						"phone": "6075551212",
+						"customFields": {
+							"pronouns": "she/her"
+						}
+					},
+					"status": "confirmed",
+					"confirmationCode": "confirm_123",
+					"paymentStatus": "paid",
+					"paymentRef": "[STRIPE] Transaction: pi_test_123",
+					"createdAt": "pinned"
+				}
+			}
+		}
+	]
+}

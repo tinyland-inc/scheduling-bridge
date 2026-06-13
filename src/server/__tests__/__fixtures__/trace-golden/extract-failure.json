@@ -1,0 +1,51 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/navigate",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/fill-form",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/bypass-payment",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/submit",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/extract-confirmation",
+			"outcome": "error:WizardStepError"
+		}
+	],
+	"terminal": {
+		"status": "reconcile_required",
+		"code": "SCRAPE_FAILED",
+		"step": "extract-confirmation",
+		"retryable": false,
+		"message": "Wizard step 'extract' failed: extract broke"
+	}
+}

@@ -1,0 +1,35 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/navigate",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/fill-form",
+			"outcome": "ok"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/bypass-payment",
+			"outcome": "ok"
+		}
+	],
+	"terminal": {
+		"status": "failed_pre_submit",
+		"code": "PAYMENT_BYPASS_NOT_PROVEN",
+		"step": "bypass-payment",
+		"retryable": false,
+		"message": "Payment bypass was not proven before submit"
+	}
+}

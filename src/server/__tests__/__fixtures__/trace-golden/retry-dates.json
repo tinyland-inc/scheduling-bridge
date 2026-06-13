@@ -1,0 +1,48 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/read-dates:via-url",
+			"outcome": "error:WizardStepError"
+		},
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/read-dates:via-url",
+			"outcome": "ok"
+		}
+	],
+	"transitions": [
+		{
+			"status": "failed_pre_submit",
+			"failure": {
+				"status": "failed_pre_submit",
+				"code": "SCRAPE_FAILED",
+				"step": "refresh-availability-dates",
+				"retryable": true,
+				"message": "Wizard step 'read-availability' failed: transient read failure"
+			}
+		},
+		{
+			"status": "queued"
+		},
+		{
+			"status": "succeeded",
+			"attempts": 2,
+			"result": {
+				"kind": "availability_dates_refresh",
+				"dates": [
+					{
+						"date": "2026-06-20",
+						"slots": 1
+					}
+				]
+			}
+		}
+	]
+}

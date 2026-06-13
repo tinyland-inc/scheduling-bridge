@@ -1,0 +1,19 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/navigate",
+			"outcome": "error:WizardStepError"
+		}
+	],
+	"terminal": {
+		"status": "failed_pre_submit",
+		"code": "SCRAPE_FAILED",
+		"step": "navigate",
+		"retryable": true,
+		"message": "Wizard step 'navigate' failed: nav broke"
+	}
+}

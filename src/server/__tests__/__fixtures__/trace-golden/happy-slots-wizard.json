@@ -1,0 +1,21 @@
+{
+	"events": [
+		{
+			"kind": "scope-open"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/read-slots:wizard",
+			"outcome": "ok"
+		}
+	],
+	"terminal": {
+		"status": "succeeded"
+	},
+	"result": [
+		{
+			"datetime": "2026-06-21T15:00:00.000Z",
+			"available": true
+		}
+	]
+}

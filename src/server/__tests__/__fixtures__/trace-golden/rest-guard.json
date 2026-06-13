@@ -1,0 +1,10 @@
+{
+	"events": [],
+	"terminal": {
+		"status": "failed_pre_submit",
+		"code": "REST_BOOKING_NOT_WIRED",
+		"step": "execution-path",
+		"retryable": false,
+		"message": "Acuity REST booking execution is selected but not wired in this worker"
+	}
+}

@@ -83,7 +83,9 @@ describe('GET /internal/flows', () => {
 		expect(booking?.plan.nodes.map((node) => node.stepId)).toEqual([
 			'acuity/navigate',
 			'acuity/fill-form',
-			'acuity/bypass-payment',
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
 			'acuity/submit',
 			'acuity/extract-confirmation',
 		]);

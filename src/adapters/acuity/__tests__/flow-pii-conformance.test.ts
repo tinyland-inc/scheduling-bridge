@@ -7,9 +7,10 @@
  *
  * The redaction is applied by run.ts's segment-boundary encode using the
  * `redactable(...)` annotations on the spec (flow-steps.ts ClientStateSchema +
- * confirmation.rawText). Because every booking step is its own segment, every
- * `completed` row is a segment boundary and carries a stateDelta — so this exercises
- * the encode path on each provided key.
+ * confirmation.rawText). Every booking segment carries a stateDelta on its LAST
+ * node; the payment-injection sub-flow (design §7; TIN-2095) shares one
+ * 'bypass-payment' segment, so its `bypass` delta is journaled on the terminal
+ * sub-step (verify-zero-total). The scan still covers every provided key's encode.
  */
 
 import { Effect, Layer } from 'effect';
@@ -83,11 +84,32 @@ const bookingFlow = makeFlow(acuityBookingFlowSpec, ACUITY_BOOKING_INITIAL_KEYS)
 			},
 		}),
 	)
+	// Payment-injection sub-flow (design §7; TIN-2095): three sub-steps sharing the
+	// 'bypass-payment' segment. Only the segment-boundary (last) sub-step carries a
+	// stateDelta; the PII scan still covers `bypass` via verify-zero-total's row.
 	.add(
 		step(
-			'acuity/bypass-payment',
+			'acuity/open-coupon-entry',
 			'bypass-payment',
 			['couponCode', 'paymentRef', 'paymentProcessor', 'form'],
+			['couponEntry'],
+			{ couponEntry: { opened: true } },
+		),
+	)
+	.add(
+		step(
+			'acuity/apply-coupon',
+			'bypass-payment',
+			['couponCode', 'paymentRef', 'paymentProcessor', 'couponEntry'],
+			['couponApplication'],
+			{ couponApplication: { applied: true } },
+		),
+	)
+	.add(
+		step(
+			'acuity/verify-zero-total',
+			'bypass-payment',
+			['couponCode', 'paymentRef', 'paymentProcessor', 'couponApplication'],
 			['bypass'],
 			{ bypass: { couponApplied: true, code: 'COUPON', totalAfterCoupon: '$0.00' } },
 		),

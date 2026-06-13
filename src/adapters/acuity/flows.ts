@@ -5,9 +5,12 @@
  *
  * - `booking_create_with_payment` matches the PRODUCTION WORKER step sequence
  *   (`createBookingWithPayment`, src/server/worker.ts): navigate → fill-form →
- *   bypass-payment (payment-injection, $0-proof boundary) → submit (effectful-once,
- *   the reconcile_required boundary) → extract-confirmation. Segments mirror the
- *   worker's per-step page lifecycle (see flow-steps.ts header).
+ *   the payment-injection sub-flow (open-coupon-entry → apply-coupon →
+ *   verify-zero-total, one 'bypass-payment' segment, the $0-proof boundary on
+ *   verify-zero-total; design §7, TIN-2095) → submit (effectful-once, the
+ *   reconcile_required boundary) → extract-confirmation. The booking segments
+ *   mirror the worker's per-step page lifecycle (see flow-steps.ts header), and
+ *   the three payment sub-steps share ONE page session ('bypass-payment' segment).
  * - `availability_dates_refresh` / `availability_slots_refresh` are the two
  *   availability refresh flows, each a single self-navigating read step with the
  *   worker's numeric-id dispatch.
@@ -27,7 +30,9 @@ import {
 	acuityAvailabilityDatesFlowSpec,
 	acuityAvailabilitySlotsFlowSpec,
 	acuityBookingFlowSpec,
-	acuityBypassPaymentStep,
+	acuityOpenCouponEntryStep,
+	acuityApplyCouponStep,
+	acuityVerifyZeroTotalStep,
 	acuityExtractConfirmationStep,
 	acuityFillFormStep,
 	acuityReadDatesStep,
@@ -64,7 +69,12 @@ export const acuityBookingFlow: Flow<AcuityBookingFlowSpec, MiddlewareError | un
 			}),
 		)
 		.add(acuityFillFormStep)
-		.add(acuityBypassPaymentStep)
+		// Payment-injection sub-flow (design §7; TIN-2095): the coupon-bypass segment
+		// as three reusable steps, sharing the 'bypass-payment' segment. The $0 proof
+		// (PAYMENT_BYPASS_NOT_PROVEN) is verify-zero-total's Diverged landing.
+		.add(acuityOpenCouponEntryStep)
+		.add(acuityApplyCouponStep)
+		.add(acuityVerifyZeroTotalStep)
 		.add(acuitySubmitStep)
 		.add(acuityExtractConfirmationStep)
 		.build({

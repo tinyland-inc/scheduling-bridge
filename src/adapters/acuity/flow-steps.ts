@@ -49,6 +49,7 @@ import {
 	extractBusinessFromPage,
 	businessToServices,
 } from './steps/extract-business.js';
+import { redactable } from '../../flow/redaction.js';
 
 // =============================================================================
 // STATIONS — acuity:* landing vocabulary (fuzzy-out)
@@ -142,14 +143,19 @@ export const isAcuityAppointmentTypeId = (serviceId: string): boolean =>
 // properties: absent values are encoded as null so the Encoded side stays JsonValue)
 // =============================================================================
 
+// PII-bearing client fields: names, email, phone, free-text notes (intake/health),
+// and the customFields intake-answer record. Marked redactable so the journaled
+// segment-boundary stateDelta carries only placeholders (design §5 "PII hygiene",
+// risk 9). The annotations do NOT change the encoded AST tag (StringKeyword /
+// Union / Record), so the JSON-encodability fence and source fences still pass.
 const ClientStateSchema = Schema.Struct({
-	firstName: Schema.String,
-	lastName: Schema.String,
-	email: Schema.String,
-	phone: Schema.NullOr(Schema.String),
-	notes: Schema.NullOr(Schema.String),
-	customFields: Schema.NullOr(
-		Schema.Record({ key: Schema.String, value: Schema.String }),
+	firstName: redactable(Schema.String),
+	lastName: redactable(Schema.String),
+	email: redactable(Schema.String),
+	phone: redactable(Schema.NullOr(Schema.String)),
+	notes: redactable(Schema.NullOr(Schema.String)),
+	customFields: redactable(
+		Schema.NullOr(Schema.Record({ key: Schema.String, value: Schema.String })),
 	),
 });
 
@@ -220,8 +226,9 @@ export const acuityBookingFlowSpec = {
 		confirmationCode: Schema.NullOr(Schema.String),
 		serviceName: Schema.NullOr(Schema.String),
 		datetime: Schema.NullOr(Schema.String),
-		providerName: Schema.NullOr(Schema.String),
-		rawText: Schema.String,
+		providerName: redactable(Schema.NullOr(Schema.String)),
+		// Full confirmation-page text echoes the client name/email; redactable PII.
+		rawText: redactable(Schema.String),
 	}),
 } as const;
 

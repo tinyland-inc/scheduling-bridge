@@ -16,7 +16,7 @@
  * by |nodes| x (1 + sum of maxReentries over recovery edges).
  */
 
-import { Data, Effect, Schedule, Schema, type Layer, type Scope } from 'effect';
+import { Data, Effect, Schedule, Schema, SchemaAST, type Layer, type Scope } from 'effect';
 import type { FlowStateSpec, StateOf } from './state.js';
 import type { Flow } from './flow.js';
 import type { FlowPlanNode } from './plan.js';
@@ -24,6 +24,7 @@ import type { LandingObservation, LandingOutcome, StationId } from './station.js
 import { FlowJournal, type CheckpointStatus, type FlowCheckpoint } from './journal.js';
 import type { FlowOutcome } from './outcome.js';
 import type { StepOutcome } from './step.js';
+import { redactEncoded } from './redaction.js';
 
 export class FlowDivergedError extends Data.TaggedError('FlowDivergedError')<{
 	readonly stepId: string;
@@ -57,6 +58,39 @@ export interface RunFlowOptions<RS = never, ES = never, RIn = never> {
 	 * Default false: behavior is byte-identical to the pre-resume fold.
 	 */
 	readonly resume?: boolean;
+	/**
+	 * Per-stepId observability hook (design §10 0.6.x). Absent ⇒ no metrics recorded
+	 * (flag-off behavior unchanged). The production wiring backs it with
+	 * `shared/metrics.ts` collectors; tests pass a spy.
+	 */
+	readonly metrics?: FlowMetricsHook;
+}
+
+/**
+ * The fold's landing classification, surfaced to the metrics hook (design §5/§10 0.6.x
+ * "per-stepId metrics"). Mirrors LandingOutcome._tag minus the internal reroute target.
+ */
+export type FlowStepLanding = 'on-track' | 'recoverable' | 'diverged';
+
+/**
+ * Per-stepId observability hook (design §10 0.6.x). The fold records attempts,
+ * failures, reroutes, run duration, and landing outcomes by stepId; the production
+ * wiring (src/server/flow-runner.ts) backs this with `shared/metrics.ts` prom-client
+ * collectors, keeping prom-client out of the flow primitives. All methods are
+ * optional and synchronous (they wrap `.inc()`/`.observe()` calls). Cardinality is
+ * bounded by the registered plan step ids — never per-request data.
+ */
+export interface FlowMetricsHook {
+	/** A step attempt began (one per 'started' checkpoint). */
+	readonly onAttempt?: (flowId: string, stepId: string) => void;
+	/** A step attempt's `run` failed (threw/errored), before classification. */
+	readonly onFailure?: (flowId: string, stepId: string) => void;
+	/** A known-but-unexpected landing rerouted along a recovery edge. */
+	readonly onReroute?: (flowId: string, stepId: string) => void;
+	/** A step attempt's `run` wall time in seconds (success or failure). */
+	readonly onDuration?: (flowId: string, stepId: string, seconds: number) => void;
+	/** The classified landing outcome for a completed/diverged/rerouted attempt. */
+	readonly onLanding?: (flowId: string, stepId: string, landing: FlowStepLanding) => void;
 }
 
 type NodeResult = { readonly kind: 'advance' } | { readonly kind: 'reroute'; readonly to: number };
@@ -84,6 +118,8 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 		const journal = yield* FlowJournal;
 		const nodes = flow.plan.nodes;
 		const indexOf = new Map(nodes.map((node, i) => [node.stepId, i]));
+		const metrics = options.metrics;
+		const flowId = flow.plan.flowId;
 
 		// Contiguous segment runs in topological (plan) order; contiguity is build-validated.
 		const segments: { segment: string; start: number; end: number }[] = [];
@@ -158,7 +194,11 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 				for (const key of providedKeys) {
 					const schema = flow.spec[key];
 					if (!schema) continue;
-					entries.push([key, yield* Schema.encodeUnknown(schema)(state[key])]);
+					// Encode, then apply PII redaction annotations (design §5 "PII hygiene":
+					// Schema redaction on encode) so journaled stateDelta never carries raw
+					// client names/emails/intake answers — only a non-reversible placeholder.
+					const encoded = yield* Schema.encodeUnknown(schema)(state[key]);
+					entries.push([key, redactEncoded(SchemaAST.encodedAST(schema.ast), encoded)]);
 				}
 				return Object.fromEntries(entries) as Record<string, unknown>;
 			}).pipe(
@@ -251,10 +291,14 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 
 				const knownToken = tokens.get(node.stepId);
 				yield* checkpoint(node.stepId, attempt, 'started', knownToken ? { idempotencyToken: knownToken } : {});
+				// Per-stepId metrics (design §10 0.6.x): one attempt per 'started'.
+				metrics?.onAttempt?.(flowId, node.stepId);
 
 				// Thread the known (re-attached or journal-seeded) token back into the step
 				// (design §5: a retried payment-injection segment reuses the journaled
-				// idempotencyToken instead of minting another).
+				// idempotencyToken instead of minting another). The run is timed for the
+				// per-stepId duration histogram; failures still record their wall time.
+				const startedAt = Date.now();
 				const outcome = (yield* Effect.retry(
 					step.run(
 						input as never,
@@ -263,11 +307,19 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 					(step.meta.retry ?? Schedule.stop) as Schedule.Schedule<unknown, unknown>,
 				).pipe(
 					Effect.tapError((error) =>
-						checkpoint(node.stepId, attempt, 'failed', {
-							error: { code: errorCode(error), message: errorMessage(error), retryable: false },
-						}),
+						Effect.sync(() => {
+							metrics?.onDuration?.(flowId, node.stepId, (Date.now() - startedAt) / 1000);
+							metrics?.onFailure?.(flowId, node.stepId);
+						}).pipe(
+							Effect.zipRight(
+								checkpoint(node.stepId, attempt, 'failed', {
+									error: { code: errorCode(error), message: errorMessage(error), retryable: false },
+								}),
+							),
+						),
 					),
 				)) as StepOutcome<Spec, keyof Spec & string>;
+				metrics?.onDuration?.(flowId, node.stepId, (Date.now() - startedAt) / 1000);
 
 				for (const resolution of outcome.resolutions ?? []) {
 					confidenceFloor = Math.min(confidenceFloor, resolution.confidence);
@@ -276,6 +328,7 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 
 				const landing = classify(node, outcome.observed);
 				if (landing._tag === 'Diverged') {
+					metrics?.onLanding?.(flowId, node.stepId, 'diverged');
 					yield* checkpoint(node.stepId, attempt, 'failed', {
 						...(outcome.observed ? { landing: outcome.observed } : {}),
 						error: {
@@ -287,6 +340,8 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 					return yield* Effect.fail(new FlowDivergedError({ stepId: node.stepId, observation: landing.observation }));
 				}
 				if (landing._tag === 'Recoverable') {
+					metrics?.onLanding?.(flowId, node.stepId, 'recoverable');
+					metrics?.onReroute?.(flowId, node.stepId);
 					const key = `${node.stepId}=>${landing.rerouteTo}`;
 					const remaining = (budgets.get(key) ?? 0) - 1;
 					budgets.set(key, remaining);
@@ -297,6 +352,7 @@ export const runFlow = <Spec extends FlowStateSpec, E, R, RS = never, ES = never
 					});
 					return { kind: 'reroute', to: indexOf.get(landing.rerouteTo) as number } as NodeResult;
 				}
+				metrics?.onLanding?.(flowId, node.stepId, 'on-track');
 
 				Object.assign(state, outcome.state);
 				for (const key of node.provides) providedKeys.add(key);

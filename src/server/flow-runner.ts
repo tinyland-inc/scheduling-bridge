@@ -35,18 +35,29 @@ import {
 	FlowJournal,
 	FlowRunError,
 	createInMemoryFlowJournal,
+	createNoopFlowJournal,
 	createPostgresFlowJournal,
 	createRedisFlowJournal,
+	parseFlowJournalSampleRate,
 	parseFlowJournalTtlSeconds,
 	runFlow,
+	shouldJournalReadFlow,
 	type Flow,
 	type FlowCheckpoint,
 	type FlowJournalShape,
+	type FlowMetricsHook,
 	type FlowOutcome,
 	type FlowPlanNode,
 	type LandingObservation,
 } from '../flow/index.js';
 import type { StateOf } from '../flow/state.js';
+import {
+	observeFlowStepDuration,
+	recordFlowStepAttempt,
+	recordFlowStepFailure,
+	recordFlowStepLanding,
+	recordFlowStepReroute,
+} from '../shared/metrics.js';
 
 // =============================================================================
 // FLAG
@@ -326,18 +337,42 @@ const traceJournal = (
 	read: journal.read,
 });
 
+/**
+ * Per-stepId metrics hook (design §10 0.6.x), backed by the `shared/metrics.ts`
+ * prom-client collectors. Shared by booking and read paths — cardinality is bounded
+ * by the registered plan step ids. Only ever invoked on the flagged path (the fold);
+ * the default legacy path records nothing here.
+ */
+export const flowMetricsHook: FlowMetricsHook = {
+	onAttempt: recordFlowStepAttempt,
+	onFailure: recordFlowStepFailure,
+	onReroute: recordFlowStepReroute,
+	onDuration: observeFlowStepDuration,
+	onLanding: (flowId, stepId, landing) =>
+		recordFlowStepLanding(
+			flowId,
+			stepId,
+			landing === 'on-track' ? 'on_track' : landing,
+		),
+};
+
+interface RunFlowToOutcomeOptions {
+	readonly resume?: boolean;
+}
+
 const runFlowToOutcome = async <Spec extends Record<string, any>>(
 	deps: FlowExecutionDeps,
 	flow: Flow<any, MiddlewareError | undefined, any>,
 	initial: Record<string, unknown>,
 	operationId: string,
-	resume = false,
+	opts: RunFlowToOutcomeOptions = {},
 ): Promise<FlowOutcome<Partial<StateOf<Spec>>>> => {
 	const trace = { lastStarted: undefined as string | undefined };
 	const effect = runFlow(flow as Flow<Spec, MiddlewareError | undefined, any>, initial as never, {
 		operationId,
 		sessionLayer: deps.sessionLayer,
-		resume,
+		resume: opts.resume ?? false,
+		metrics: flowMetricsHook,
 	}).pipe(
 		Effect.provideService(FlowJournal, traceJournal(deps.journal, trace)),
 	) as unknown as Effect.Effect<unknown, unknown, never>;
@@ -559,12 +594,13 @@ export const executeBookingThroughFlow = async (
 		return probeConfirmationGate(deps, flow, command, initial, rows, pending, operationId);
 	}
 
+	// Booking flows ALWAYS await journaling and are never sampled out (design §5).
 	const outcome = await runFlowToOutcome<AcuityBookingFlowSpec>(
 		deps,
 		flow,
 		initial,
 		operationId,
-		true,
+		{ resume: true },
 	);
 	const confirmation = outcome.output.confirmation;
 	if (!confirmation) {
@@ -602,12 +638,28 @@ export const executeReadThroughFlow = async <A>(
 	context: BridgeJobLeaseContext | undefined,
 ): Promise<A> => {
 	await checkFlowPlanSkew(flow, deps.journal, context);
+	// Read-flow journal sampling (design §5 "Checkpoint persistence discipline" /
+	// §10 0.6.x BRIDGE_FLOW_JOURNAL_SAMPLE): availability/read flows are sampled by
+	// the knob; default rate 1.0 = journal every run (current behavior). Sampled OUT
+	// ⇒ swap in a no-op journal so no rows persist (the skew check already ran against
+	// the REAL journal above) and resume is skipped (a sampled-out read has nothing to
+	// resume from; read steps re-run freely anyway). Sampled IN ⇒ journal as usual.
+	//
+	// Journaling stays AWAITED even for reads: the merged resume lane relies on read
+	// journal rows being durably present, and the design's latency argument is already
+	// satisfied because journal writes happen INSIDE job execution, never between the
+	// request and the SETNX/snapshot path. The fold's read appends are still
+	// failure-tolerant (log-and-continue), so a journal hiccup never fails a read.
+	const sampleIn = shouldJournalReadFlow(parseFlowJournalSampleRate());
+	const readDeps: FlowExecutionDeps = sampleIn
+		? deps
+		: { ...deps, journal: createNoopFlowJournal() };
 	const outcome = await runFlowToOutcome(
-		deps,
+		readDeps,
 		flow,
 		initial,
 		context?.operationId ?? randomUUID(),
-		true,
+		{ resume: sampleIn },
 	);
 	return (outcome.output as Record<string, unknown>)[outputKey] as A;
 };

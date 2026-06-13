@@ -122,6 +122,32 @@ export interface PostgresFlowJournalOptions {
 export type PostgresFlowJournal = FlowJournalShape & {
 	close?: () => Promise<void>;
 	ready: () => Promise<void>;
+	/**
+	 * TTL purge (design §5 "PII hygiene": "a TTL purge job bounds retention"; risk 9):
+	 * delete checkpoint rows whose `at` is older than `retentionSeconds`. The Redis
+	 * journal gets this for free via EXPIRE-per-append; Postgres needs an explicit
+	 * periodic delete. Returns the number of rows deleted. Idempotent and safe to run
+	 * concurrently across replicas (a plain bounded DELETE).
+	 */
+	purgeExpiredCheckpoints: (retentionSeconds: number) => Promise<number>;
+};
+
+/**
+ * Manual/periodic TTL purge against an arbitrary pool — the ops-facing entry point
+ * (design §5 "TTL purge job"). Deletes `flow_checkpoints` rows older than
+ * `retentionSeconds` and returns the deleted-row count. Exported standalone so an
+ * operator can run a one-shot purge without constructing a full journal.
+ */
+export const purgeFlowCheckpoints = async (
+	pool: pg.Pool,
+	retentionSeconds: number,
+): Promise<number> => {
+	if (!Number.isFinite(retentionSeconds) || retentionSeconds <= 0) return 0;
+	const result = await pool.query(
+		`delete from flow_checkpoints where at < now() - make_interval(secs => $1)`,
+		[retentionSeconds],
+	);
+	return result.rowCount ?? 0;
 };
 
 export const ensureFlowJournalSchema = async (pool: pg.Pool): Promise<void> => {
@@ -252,6 +278,10 @@ export const createPostgresFlowJournal = (
 			}),
 		ready: async () => {
 			await ready;
+		},
+		purgeExpiredCheckpoints: async (retentionSeconds) => {
+			await ready;
+			return purgeFlowCheckpoints(pool, retentionSeconds);
 		},
 	};
 

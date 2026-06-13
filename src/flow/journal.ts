@@ -93,3 +93,16 @@ export const FlowJournalMemoryLive: Layer.Layer<FlowJournal> = Layer.sync(
 	FlowJournal,
 	createInMemoryFlowJournal,
 );
+
+/**
+ * No-op journal: satisfies the FlowJournal Tag while writing nothing and reading
+ * empty. Used for read (availability) flow runs that are SAMPLED OUT by
+ * `BRIDGE_FLOW_JOURNAL_SAMPLE` (design §5 "Checkpoint persistence discipline"): the
+ * fold's append/read calls are kept structurally identical, but no checkpoint row is
+ * persisted. Booking flows never use this — they are unconditionally journaled.
+ * `append` returns a synthetic seq-0 row so the fold's evidence-only contract holds.
+ */
+export const createNoopFlowJournal = (): FlowJournalShape => ({
+	append: (cp) => Effect.sync(() => ({ ...cp, seq: 0 }) as FlowCheckpoint),
+	read: () => Effect.sync(() => [] as readonly FlowCheckpoint[]),
+});

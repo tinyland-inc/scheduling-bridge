@@ -65,13 +65,19 @@ export {
 	FlowJournalMemoryLive,
 	JournalError,
 	createInMemoryFlowJournal,
+	createNoopFlowJournal,
 	type CheckpointStatus,
 	type FlowCheckpoint,
 	type FlowJournalShape,
 } from './journal.js';
 export {
+	DEFAULT_FLOW_JOURNAL_PURGE_INTERVAL_MS,
+	DEFAULT_FLOW_JOURNAL_SAMPLE_RATE,
 	DEFAULT_FLOW_JOURNAL_TTL_SECONDS,
+	parseFlowJournalPurgeIntervalMs,
+	parseFlowJournalSampleRate,
 	parseFlowJournalTtlSeconds,
+	shouldJournalReadFlow,
 } from './journal-config.js';
 export {
 	DEFAULT_FLOW_JOURNAL_KEY_PREFIX,
@@ -83,10 +89,25 @@ export {
 	FLOW_JOURNAL_SCHEMA_SQL,
 	createPostgresFlowJournal,
 	ensureFlowJournalSchema,
+	purgeFlowCheckpoints,
 	type PostgresFlowJournal,
 	type PostgresFlowJournalOptions,
 } from './postgres-journal.js';
-export { FlowDivergedError, FlowRunError, runFlow, type RunFlowOptions } from './run.js';
+export {
+	FlowDivergedError,
+	FlowRunError,
+	runFlow,
+	type FlowMetricsHook,
+	type FlowStepLanding,
+	type RunFlowOptions,
+} from './run.js';
+export {
+	PiiRedactionAnnotationId,
+	REDACTED_PLACEHOLDER,
+	isRedacted,
+	redactEncoded,
+	redactable,
+} from './redaction.js';
 export type { FlowOutcome } from './outcome.js';
 export { VendorFlowPack, type SelectorRegistry } from './vendor.js';
 export {

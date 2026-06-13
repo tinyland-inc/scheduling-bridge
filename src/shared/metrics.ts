@@ -176,6 +176,85 @@ const flowShadowStepMismatchTotal = new Counter({
 	registers: [registry],
 });
 
+// ─── Per-stepId flow runtime metrics (design §10 0.6.x "per-stepId metrics") ────
+//
+// Recorded by the fold (src/flow/run.ts via the FlowMetricsHook) when the flag is
+// on. Cardinality is bounded by the registered plan step ids — a handful of stable
+// ids per flow — exactly as the flow-shadow metrics above; NEVER per-request data
+// (no operation_id, no service_id). Booking jobs await journaling; metrics are cheap
+// synchronous counter/histogram increments either way.
+
+const flowStepAttemptsTotal = new Counter({
+	name: 'acuity_flow_step_attempts_total',
+	help: 'Flow step execution attempts by flow and step id (one per started checkpoint)',
+	labelNames: ['flow_id', 'step_id'],
+	registers: [registry],
+});
+
+const flowStepFailuresTotal = new Counter({
+	name: 'acuity_flow_step_failures_total',
+	help: 'Flow step run failures (the step program errored) by flow and step id',
+	labelNames: ['flow_id', 'step_id'],
+	registers: [registry],
+});
+
+const flowStepReroutesTotal = new Counter({
+	name: 'acuity_flow_step_reroutes_total',
+	help: 'Flow step recovery-edge reroutes (known-but-unexpected landing) by flow and step id',
+	labelNames: ['flow_id', 'step_id'],
+	registers: [registry],
+});
+
+const flowStepLandingsTotal = new Counter({
+	name: 'acuity_flow_step_landings_total',
+	help: 'Flow step landing-classification outcomes by flow, step id, and landing (on_track|recoverable|diverged)',
+	labelNames: ['flow_id', 'step_id', 'landing'],
+	registers: [registry],
+});
+
+const flowStepDuration = new Histogram({
+	name: 'acuity_flow_step_duration_seconds',
+	help: 'Flow step run wall time (success or failure) by flow and step id',
+	labelNames: ['flow_id', 'step_id'],
+	buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
+	registers: [registry],
+});
+
+/** A flow step attempt began (one per started checkpoint). */
+export const recordFlowStepAttempt = (flowId: string, stepId: string): void => {
+	flowStepAttemptsTotal.inc({ flow_id: flowId, step_id: stepId });
+};
+
+/** A flow step's `run` program failed. */
+export const recordFlowStepFailure = (flowId: string, stepId: string): void => {
+	flowStepFailuresTotal.inc({ flow_id: flowId, step_id: stepId });
+};
+
+/** A flow step rerouted along a declared recovery edge. */
+export const recordFlowStepReroute = (flowId: string, stepId: string): void => {
+	flowStepReroutesTotal.inc({ flow_id: flowId, step_id: stepId });
+};
+
+export type FlowStepLandingLabel = 'on_track' | 'recoverable' | 'diverged';
+
+/** A flow step's landing-classification outcome. */
+export const recordFlowStepLanding = (
+	flowId: string,
+	stepId: string,
+	landing: FlowStepLandingLabel,
+): void => {
+	flowStepLandingsTotal.inc({ flow_id: flowId, step_id: stepId, landing });
+};
+
+/** A flow step's `run` wall time in seconds (success or failure). */
+export const observeFlowStepDuration = (
+	flowId: string,
+	stepId: string,
+	seconds: number,
+): void => {
+	flowStepDuration.observe({ flow_id: flowId, step_id: stepId }, Math.max(0, seconds));
+};
+
 // ─── Derived cache hit-ratio ─────────────────────────────────────────────────
 //
 // `cacheHitRatio` is a derived gauge — prom-client cannot compute it for us,
@@ -489,6 +568,16 @@ export const metrics = {
 	availabilitySnapshotAgeSeconds,
 	flowShadowRunsTotal,
 	flowShadowStepMismatchTotal,
+	flowStepAttemptsTotal,
+	flowStepFailuresTotal,
+	flowStepReroutesTotal,
+	flowStepLandingsTotal,
+	flowStepDuration,
+	recordFlowStepAttempt,
+	recordFlowStepFailure,
+	recordFlowStepReroute,
+	recordFlowStepLanding,
+	observeFlowStepDuration,
 	recordCacheHit,
 	recordCacheMiss,
 	setBrowserPageLimiterState,

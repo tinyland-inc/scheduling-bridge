@@ -39,6 +39,13 @@ import { createPostgresBridgeAsyncStore } from '../async/postgres-store.js';
 import { createRedisBridgeAsyncStore } from '../async/redis-store.js';
 import { parseRedisAsyncJobTtlSeconds } from '../async/config.js';
 import {
+	createPostgresFlowJournal,
+	parseFlowJournalPurgeIntervalMs,
+	parseFlowJournalTtlSeconds,
+	DEFAULT_FLOW_JOURNAL_TTL_SECONDS,
+	type PostgresFlowJournal,
+} from '../flow/index.js';
+import {
 	createAcuityBridgeJobExecutor,
 	runBridgeWorkerLoop,
 } from './worker.js';
@@ -170,6 +177,85 @@ const createBridgeAsyncStore = (): BridgeAsyncStore => {
 export let bridgeAsyncStore: BridgeAsyncStore = createBridgeAsyncStore();
 let inlineWorkerAbortController: AbortController | null = null;
 
+// ─── Flow journal TTL purge (design §5 "PII hygiene": "a TTL purge job bounds
+// retention"; risk 9) ────────────────────────────────────────────────────────
+//
+// Redis journal keys carry retention via EXPIRE-per-append (redis-journal.ts), so
+// no sweep is needed there. The Postgres `flow_checkpoints` table needs an explicit
+// periodic DELETE of rows older than the retention TTL. The sweep is tied to the
+// inline worker lifecycle (only the replica running the worker owns this chore) and
+// runs only when a Postgres journal is in play (BRIDGE_DATABASE_URL set). The
+// interval handle is unref'd so it never holds the process open.
+let flowJournalPurgeTimer: ReturnType<typeof setInterval> | null = null;
+let flowJournalPurgeHandle: PostgresFlowJournal | null = null;
+
+const flowJournalRetentionSeconds = (): number =>
+	parseFlowJournalTtlSeconds() ?? DEFAULT_FLOW_JOURNAL_TTL_SECONDS;
+
+/**
+ * One-shot manual purge of expired Postgres flow-journal checkpoints — the
+ * ops-facing entry point. Returns the deleted-row count (0 when no Postgres journal
+ * is configured). Safe to call independently of the periodic sweep.
+ */
+export const purgeFlowJournalCheckpoints = async (): Promise<number> => {
+	if (!BRIDGE_DATABASE_URL) return 0;
+	const handle =
+		flowJournalPurgeHandle ??
+		createPostgresFlowJournal({
+			connectionString: BRIDGE_DATABASE_URL,
+			ssl: process.env.BRIDGE_DATABASE_SSL === 'true',
+			// Ensure the flow_checkpoints table exists (idempotent `create table if not
+			// exists`) so the purge never errors on a DB where the flow runner has not
+			// yet created it; the ready gate runs the DDL before the first DELETE.
+			migrate: process.env.BRIDGE_DATABASE_MIGRATE !== 'false',
+		});
+	flowJournalPurgeHandle ??= handle;
+	return handle.purgeExpiredCheckpoints(flowJournalRetentionSeconds());
+};
+
+const startFlowJournalPurge = () => {
+	if (!BRIDGE_DATABASE_URL || flowJournalPurgeTimer) return;
+	const intervalMs = parseFlowJournalPurgeIntervalMs();
+	const sweep = () => {
+		void purgeFlowJournalCheckpoints()
+			.then((deleted) => {
+				if (deleted > 0) {
+					logEvent('INFO', 'Flow journal TTL purge swept rows', {
+						event: 'flow_journal_purge_swept',
+						deleted,
+						retentionSeconds: flowJournalRetentionSeconds(),
+					});
+				}
+			})
+			.catch((error) => {
+				logEvent('ERROR', 'Flow journal TTL purge failed', {
+					event: 'flow_journal_purge_failed',
+					error: describeLogValue(error),
+				});
+			});
+	};
+	flowJournalPurgeTimer = setInterval(sweep, intervalMs);
+	flowJournalPurgeTimer.unref?.();
+	logEvent('INFO', 'Flow journal TTL purge started', {
+		event: 'flow_journal_purge_started',
+		intervalMs,
+		retentionSeconds: flowJournalRetentionSeconds(),
+	});
+	// Kick an immediate first sweep so a long interval does not delay initial cleanup.
+	sweep();
+};
+
+const stopFlowJournalPurge = () => {
+	if (flowJournalPurgeTimer) {
+		clearInterval(flowJournalPurgeTimer);
+		flowJournalPurgeTimer = null;
+	}
+	if (flowJournalPurgeHandle?.close) {
+		void flowJournalPurgeHandle.close().catch(() => undefined);
+	}
+	flowJournalPurgeHandle = null;
+};
+
 export const startInlineWorker = () => {
 	if (!BRIDGE_INLINE_WORKER_ENABLED || inlineWorkerAbortController) return;
 	inlineWorkerAbortController = new AbortController();
@@ -194,9 +280,12 @@ export const startInlineWorker = () => {
 		workerId,
 		store: BRIDGE_DATABASE_URL ? 'postgres' : redisClient ? 'redis' : 'memory',
 	});
+	// The replica running the inline worker also owns the Postgres journal TTL purge.
+	startFlowJournalPurge();
 };
 
 export const stopInlineWorker = () => {
+	stopFlowJournalPurge();
 	if (!inlineWorkerAbortController) return;
 	inlineWorkerAbortController.abort();
 	inlineWorkerAbortController = null;

@@ -17,7 +17,7 @@
  */
 
 import { Effect } from 'effect';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const stepMocks = vi.hoisted(() => ({
 	navigateToBooking: vi.fn(),
@@ -514,6 +514,71 @@ describe('flag ON: status-transition parity with the legacy path (stub steps)', 
 		const flaggedSlots = await flagged.refreshAvailabilitySlots(slotsCommand);
 		expect(flaggedSlots).toEqual(legacySlots);
 		expect(stepMocks.readTimeSlots).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe('read-flow journal sampling (BRIDGE_FLOW_JOURNAL_SAMPLE; flagged path)', () => {
+	const ORIGINAL = process.env.BRIDGE_FLOW_JOURNAL_SAMPLE;
+	afterEach(() => {
+		if (ORIGINAL === undefined) delete process.env.BRIDGE_FLOW_JOURNAL_SAMPLE;
+		else process.env.BRIDGE_FLOW_JOURNAL_SAMPLE = ORIGINAL;
+	});
+
+	const datesCommand = {
+		serviceId: '53178494',
+		month: '2026-06',
+		adapterProfile,
+	};
+
+	it('journals the read flow by default (sample rate 1.0 — current behavior)', async () => {
+		delete process.env.BRIDGE_FLOW_JOURNAL_SAMPLE;
+		const journal = createInMemoryFlowJournal();
+		const flagged = createAcuityBridgeJobExecutor({
+			redisClient: null,
+			flowRunner: true,
+			flowJournal: journal,
+		});
+		const dates = await flagged.refreshAvailabilityDates(datesCommand, {
+			operationId: 'op-sample-in',
+		});
+		expect(dates).toEqual([{ date: '2026-06-20', slots: 1 }]);
+		const rows = await Effect.runPromise(journal.read('op-sample-in'));
+		expect(rows.map((r) => r.status)).toEqual(['started', 'completed']);
+	});
+
+	it('sampled OUT (rate 0): the read returns data but journals ZERO rows', async () => {
+		process.env.BRIDGE_FLOW_JOURNAL_SAMPLE = '0';
+		const journal = createInMemoryFlowJournal();
+		const flagged = createAcuityBridgeJobExecutor({
+			redisClient: null,
+			flowRunner: true,
+			flowJournal: journal,
+		});
+		const dates = await flagged.refreshAvailabilityDates(datesCommand, {
+			operationId: 'op-sample-out',
+		});
+		// Read result is unaffected by the sampling decision.
+		expect(dates).toEqual([{ date: '2026-06-20', slots: 1 }]);
+		// No checkpoint rows persisted for a sampled-out read.
+		const rows = await Effect.runPromise(journal.read('op-sample-out'));
+		expect(rows).toEqual([]);
+	});
+
+	it('booking flows are never sampled out (always journaled) even at rate 0', async () => {
+		process.env.BRIDGE_FLOW_JOURNAL_SAMPLE = '0';
+		const journal = createInMemoryFlowJournal();
+		const flagged = createAcuityBridgeJobExecutor({
+			redisClient: null,
+			flowRunner: true,
+			flowJournal: journal,
+		});
+		await flagged.createBookingWithPayment(bookingCommand('TEST-100'), {
+			executionPath: 'browser',
+			operationId: 'op-booking-not-sampled',
+		});
+		const rows = await Effect.runPromise(journal.read('op-booking-not-sampled'));
+		expect(rows.length).toBeGreaterThan(0);
+		expect(rows.some((r) => r.stepId === 'acuity/submit')).toBe(true);
 	});
 });
 

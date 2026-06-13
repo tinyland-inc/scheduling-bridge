@@ -21,7 +21,17 @@
 		},
 		{
 			"kind": "step",
-			"stepId": "acuity/bypass-payment",
+			"stepId": "acuity/open-coupon-entry",
+			"outcome": "ok"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/apply-coupon",
+			"outcome": "ok"
+		},
+		{
+			"kind": "step",
+			"stepId": "acuity/verify-zero-total",
 			"outcome": "ok"
 		}
 	],

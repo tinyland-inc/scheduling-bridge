@@ -35,7 +35,9 @@ import type { ClientInfo } from '../../core/types.js';
 import {
 	navigateToBooking,
 	fillFormFields,
-	bypassPayment,
+	openCouponEntry,
+	applyCoupon,
+	verifyZeroTotal,
 	generateCouponCode,
 	submitBooking,
 	extractConfirmation,
@@ -216,6 +218,17 @@ export const acuityBookingFlowSpec = {
 		customFieldsCompleted: Schema.Array(Schema.String),
 		intakeFieldsCompleted: Schema.Array(Schema.String),
 		advanced: Schema.Boolean,
+	}),
+	// Payment-injection sub-flow (design §7; TIN-2095): the coupon-bypass segment
+	// decomposed into open-coupon-entry → apply-coupon → verify-zero-total. The two
+	// intermediate keys are the typed edges between the sub-steps; `bypass` (the $0
+	// proof surface) stays the segment's terminal provides so submit/extract are
+	// unchanged.
+	couponEntry: Schema.Struct({
+		opened: Schema.Boolean,
+	}),
+	couponApplication: Schema.Struct({
+		applied: Schema.Boolean,
 	}),
 	bypass: Schema.Struct({
 		couponApplied: Schema.Boolean,
@@ -498,39 +511,133 @@ export const acuityFillFormStep: BookingStep<'client' | 'navigation', 'form'> = 
 		),
 };
 
+// =============================================================================
+// PAYMENT-INJECTION SUB-FLOW (design §7; TIN-2095)
+//
+// The 0.6.x single `acuity/bypass-payment` step is decomposed into the three
+// reusable sub-steps the design names: open-coupon-entry → apply-coupon →
+// verify-zero-total. All three share one `bypass-payment` segment (one page
+// session, as the legacy step did), are tagged `payment-injection`, and are
+// idempotency `replayable-write` (session-local; safe to re-drive on a fresh
+// session, design §5). Every sub-step reuses the SAME journaled
+// `idempotencyToken` — the coupon code — rather than minting a code per attempt:
+// the token is computed via `couponToken` (the 0.6.x `generateCouponCode`
+// token-reuse path), and the fold re-attaches each sub-step's journaled token on
+// retry/resume. The $0 proof is the verify-zero-total step's fuzzy-out landing:
+// not-proven lands on 'acuity:payment' instead of the expected
+// 'acuity:payment-bypassed', yielding the PAYMENT_BYPASS_NOT_PROVEN Diverged
+// outcome on the payment-injection segment (design §6) — non-retryable, as today.
+// =============================================================================
+
 /**
- * `bypassPayment` (steps/bypass-payment.ts) as the payment-injection FlowStep
- * (design §7: Acuity's coupon-bypass implementation of the payment-injection
- * segment). The journaled `idempotencyToken` carries the coupon code — reusing
- * `generateCouponCode` output (design §5 replayable-write token reuse) — and the
- * worker's bypass-proof predicate becomes the landing observation: not-proven lands
- * on 'acuity:payment' instead of the expected 'acuity:payment-bypassed', i.e. a
- * Diverged outcome on the payment-injection segment (design §6,
- * PAYMENT_BYPASS_NOT_PROVEN).
+ * Resolve the coupon code to use for THIS payment-injection attempt: the
+ * journaled idempotencyToken when present (retry/resume — design §5
+ * replayable-write token reuse), else the 0.6.x `generateCouponCode` output
+ * (the single reusable `ACUITY_BYPASS_COUPON`). Shared by all three sub-steps so
+ * they thread the identical token.
  */
-export const acuityBypassPaymentStep: BookingStep<
+const couponToken = (
+	input: {
+		readonly couponCode: string;
+		readonly paymentRef: string;
+		readonly paymentProcessor: string;
+	},
+	context: { readonly idempotencyToken?: string } | undefined,
+): string =>
+	context?.idempotencyToken ??
+	generateCouponCode(input.paymentRef, input.paymentProcessor, input.couponCode);
+
+/** open-coupon-entry: expand the coupon section, await the input (design §7). */
+export const acuityOpenCouponEntryStep: BookingStep<
 	'couponCode' | 'paymentRef' | 'paymentProcessor' | 'form',
+	'couponEntry'
+> = {
+	meta: {
+		id: 'acuity/open-coupon-entry',
+		needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'form'],
+		provides: ['couponEntry'],
+		expects: ['acuity:payment'],
+		idempotency: 'replayable-write',
+		segment: 'bypass-payment',
+		tags: ['payment-injection'],
+		selectorKeys: ['paymentCouponToggle'],
+	},
+	run: (input, context) =>
+		Effect.suspend(() => {
+			const token = couponToken(input, context);
+			return openCouponEntry(token).pipe(
+				Effect.map((entry) => ({
+					state: { couponEntry: { opened: entry.opened } },
+					observed: {
+						expected: ['acuity:payment'],
+						observed: 'acuity:payment',
+						confidence: 1,
+						evidence: [{ kind: 'selector' as const, key: 'paymentCouponToggle', matched: true }],
+					} satisfies LandingObservation,
+					idempotencyToken: token,
+				})),
+			);
+		}),
+};
+
+/** apply-coupon: fill the reused code, click Apply, await order-summary (design §7). */
+export const acuityApplyCouponStep: BookingStep<
+	'couponCode' | 'paymentRef' | 'paymentProcessor' | 'couponEntry',
+	'couponApplication'
+> = {
+	meta: {
+		id: 'acuity/apply-coupon',
+		needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'couponEntry'],
+		provides: ['couponApplication'],
+		expects: ['acuity:payment'],
+		idempotency: 'replayable-write',
+		segment: 'bypass-payment',
+		tags: ['payment-injection'],
+		selectorKeys: ['paymentCouponInput', 'paymentCouponApply'],
+	},
+	run: (input, context) =>
+		Effect.suspend(() => {
+			const token = couponToken(input, context);
+			return applyCoupon(token).pipe(
+				Effect.map((application) => ({
+					state: { couponApplication: { applied: application.applied } },
+					observed: {
+						expected: ['acuity:payment'],
+						observed: 'acuity:payment',
+						confidence: 1,
+						evidence: [{ kind: 'selector' as const, key: 'paymentCouponApply', matched: true }],
+					} satisfies LandingObservation,
+					idempotencyToken: token,
+				})),
+			);
+		}),
+};
+
+/**
+ * verify-zero-total: prove the vendor charge was bypassed (design §6). The
+ * `isPaymentBypassProven` predicate (worker `assertPaymentBypassProven` parity)
+ * becomes the fuzzy-out landing: proven ⇒ 'acuity:payment-bypassed' (on track);
+ * not-proven ⇒ 'acuity:payment' (Diverged ⇒ PAYMENT_BYPASS_NOT_PROVEN). `bypass`
+ * stays the segment's terminal provides so submit/extract are unchanged.
+ */
+export const acuityVerifyZeroTotalStep: BookingStep<
+	'couponCode' | 'paymentRef' | 'paymentProcessor' | 'couponApplication',
 	'bypass'
 > = {
 	meta: {
-		id: 'acuity/bypass-payment',
-		needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'form'],
+		id: 'acuity/verify-zero-total',
+		needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'couponApplication'],
 		provides: ['bypass'],
 		expects: ['acuity:payment-bypassed'],
 		idempotency: 'replayable-write',
 		segment: 'bypass-payment',
 		tags: ['payment-injection'],
-		selectorKeys: ['paymentCouponToggle', 'paymentCouponInput', 'paymentCouponApply'],
+		selectorKeys: ['paymentTotal'],
 	},
 	run: (input, context) =>
 		Effect.suspend(() => {
-			// A retried/resumed payment-injection segment reuses the journaled
-			// idempotencyToken (the coupon code) instead of minting another
-			// (design §5 replayable-write token reuse).
-			const token =
-				context?.idempotencyToken ??
-				generateCouponCode(input.paymentRef, input.paymentProcessor, input.couponCode);
-			return bypassPayment(token).pipe(
+			const token = couponToken(input, context);
+			return verifyZeroTotal(token).pipe(
 				Effect.map((bypass) => {
 					const proven = isPaymentBypassProven(bypass);
 					return {

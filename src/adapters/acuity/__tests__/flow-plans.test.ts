@@ -53,11 +53,33 @@ const expectedBookingPlan: FlowPlan = {
 			segment: 'fill-form',
 			tags: ['mutation'],
 		},
+		// Payment-injection sub-flow (design §7; TIN-2095): open-coupon-entry →
+		// apply-coupon → verify-zero-total, sharing ONE 'bypass-payment' segment.
 		{
-			stepId: 'acuity/bypass-payment',
+			stepId: 'acuity/open-coupon-entry',
 			needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'form'],
-			provides: ['bypass'],
+			provides: ['couponEntry'],
 			dependsOn: ['acuity/fill-form'],
+			expects: ['acuity:payment'],
+			idempotency: 'replayable-write',
+			segment: 'bypass-payment',
+			tags: ['payment-injection'],
+		},
+		{
+			stepId: 'acuity/apply-coupon',
+			needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'couponEntry'],
+			provides: ['couponApplication'],
+			dependsOn: ['acuity/open-coupon-entry'],
+			expects: ['acuity:payment'],
+			idempotency: 'replayable-write',
+			segment: 'bypass-payment',
+			tags: ['payment-injection'],
+		},
+		{
+			stepId: 'acuity/verify-zero-total',
+			needs: ['couponCode', 'paymentRef', 'paymentProcessor', 'couponApplication'],
+			provides: ['bypass'],
+			dependsOn: ['acuity/apply-coupon'],
 			expects: ['acuity:payment-bypassed'],
 			idempotency: 'replayable-write',
 			segment: 'bypass-payment',
@@ -67,7 +89,7 @@ const expectedBookingPlan: FlowPlan = {
 			stepId: 'acuity/submit',
 			needs: ['bypass'],
 			provides: ['submission'],
-			dependsOn: ['acuity/bypass-payment'],
+			dependsOn: ['acuity/verify-zero-total'],
 			expects: ['acuity:confirmation'],
 			idempotency: 'effectful-once',
 			segment: 'submit',
@@ -127,17 +149,43 @@ describe('acuity flow plan snapshots (the flow-change review surface)', () => {
 		expect(acuityBookingFlow.plan).toEqual(expectedBookingPlan);
 	});
 
-	it('booking segments mirror the production worker page lifecycle: one segment per step', () => {
-		const segments = acuityBookingFlow.plan.nodes.map((node) => node.segment);
-		expect(new Set(segments).size).toBe(acuityBookingFlow.plan.nodes.length);
+	it('booking segments mirror the production worker page lifecycle: five contiguous segments (the payment sub-flow shares one)', () => {
+		// Contiguous segment runs in plan order. The payment-injection sub-flow
+		// (design §7; TIN-2095) groups its three sub-steps into ONE 'bypass-payment'
+		// segment; the other four steps are one segment each = five segments total.
+		const groups: { segment: string; steps: string[] }[] = [];
+		for (const node of acuityBookingFlow.plan.nodes) {
+			const last = groups[groups.length - 1];
+			if (last && last.segment === node.segment) last.steps.push(node.stepId);
+			else groups.push({ segment: node.segment, steps: [node.stepId] });
+		}
+		expect(groups.map((g) => g.segment)).toEqual([
+			'navigate',
+			'fill-form',
+			'bypass-payment',
+			'submit',
+			'extract-confirmation',
+		]);
+		expect(groups.find((g) => g.segment === 'bypass-payment')?.steps).toEqual([
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
+		]);
 	});
 
-	it('the payment-injection step is tagged and journaled as the design requires', () => {
-		const bypass = acuityBookingFlow.plan.nodes.find(
-			(node) => node.stepId === 'acuity/bypass-payment',
+	it('every payment-injection sub-step is tagged and journaled as the design requires', () => {
+		const payment = acuityBookingFlow.plan.nodes.filter((node) =>
+			node.tags.includes('payment-injection'),
 		);
-		expect(bypass?.tags).toContain('payment-injection');
-		expect(bypass?.idempotency).toBe('replayable-write');
+		expect(payment.map((node) => node.stepId)).toEqual([
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
+		]);
+		for (const node of payment) {
+			expect(node.segment).toBe('bypass-payment');
+			expect(node.idempotency).toBe('replayable-write');
+		}
 	});
 
 	it('submit is the only effectful-once node (the reconcile_required boundary driver)', () => {
@@ -182,7 +230,9 @@ describe('acuity flow plan snapshots (the flow-change review surface)', () => {
 		expect(acuityFlowStepIds('booking_create_with_payment')).toEqual([
 			'acuity/navigate',
 			'acuity/fill-form',
-			'acuity/bypass-payment',
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
 			'acuity/submit',
 			'acuity/extract-confirmation',
 		]);

@@ -66,6 +66,7 @@ ts_project(
         exclude = [
             "src/adapters/acuity/__tests__/**",
             "src/adapters/acuity/steps/__tests__/**",
+            "src/adapters/calcom/__tests__/**",
         ],
     ),
     declaration = True,

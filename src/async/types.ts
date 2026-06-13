@@ -27,7 +27,16 @@ export const DEFAULT_BOOKING_SNAPSHOT_FRESHNESS_FLOOR_MS = 90_000;
 export const DEFAULT_ON_DEMAND_REFRESH_WAIT_MS = 10_000;
 
 export interface BridgeAdapterProfile {
-	readonly backend: 'acuity';
+	/**
+	 * Minimal 0.7.0 widening (design §9 item 3, recon brief 3 item 4): the literal
+	 * widens from `'acuity'` to `'acuity' | 'calcom'` — just enough to let a CalCom
+	 * job command carry a profile while the CalCom read-only pack lands. The full
+	 * kit-instance-model enum subset (`acuity|calcom|glossgenius|vagaro`) is the 0.8.0
+	 * surface-freeze widen; deferring the rest keeps the 0.7.0 surface minimal. Widening
+	 * a literal to a union is non-breaking: producers still emit `'acuity'`, and no
+	 * consumer switches on this field today.
+	 */
+	readonly backend: 'acuity' | 'calcom';
 	readonly baseUrl: string;
 	readonly selectorProfile?: string;
 	readonly adminApiConfigured?: boolean;

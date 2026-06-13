@@ -9,7 +9,6 @@
 import { Context, type Effect } from 'effect';
 import type { Page } from 'playwright-core';
 import type { SelectorHealthReport } from '../adapters/acuity/selector-health.js';
-import type { MiddlewareError } from '../adapters/acuity/errors.js';
 import type { BridgeBackend, LandingObservation, StationId } from './station.js';
 import type { ServiceMatcher } from './fuzzy.js';
 import type { Flow } from './flow.js';
@@ -37,11 +36,18 @@ export class VendorFlowPack extends Context.Tag('scheduling-bridge/VendorFlowPac
 			readonly service: Context.Tag.Service<ServiceMatcher>;
 			/* date, field matchers are 0.7.0 */
 		};
-		/** E includes `undefined`: the existing step programs carry `catch: () =>
-		 * undefined` branches, so their honest error channel is `MiddlewareError |
-		 * undefined` (exactly the worker's `runWizardStep` E channel). */
+		/** E (and R) are erased to `any` at the pack boundary: a pack's flows carry
+		 * vendor-specific error and requirement channels. The Acuity browser pack's
+		 * honest E is `MiddlewareError | undefined` (the worker's `runWizardStep` channel,
+		 * R = BrowserService | Scope); the CalCom REST pack's is `CalComRestError |
+		 * undefined` (transport/shape, R = CalComHttpClient — no DOM). `any` here is the
+		 * MINIMAL 0.7.0 widening that admits a typed-error REST pack through the SAME tag
+		 * without inverting the flow→adapter layering (vendor.ts would otherwise import
+		 * every vendor's error union). Runtime consumers narrow errors from `unknown`
+		 * regardless (flow-runner `isMiddlewareError`), so no runtime behavior changes; a
+		 * vendor-neutral flow-error type is a 0.8.0 surface-freeze concern (§9). */
 		readonly flows: {
-			readonly [flowId: string]: Flow<any, MiddlewareError | undefined, any>;
+			readonly [flowId: string]: Flow<any, any, any>;
 		};
 		readonly paymentInjection: 'native' | 'coupon-bypass' | 'external-link';
 	}

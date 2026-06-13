@@ -26,6 +26,8 @@ import type { MiddlewareError } from './errors.js';
 import type { BrowserService } from '../../shared/browser-service.js';
 import type { FlowStep } from '../../flow/step.js';
 import type { FuzzyResolution } from '../../flow/fuzzy.js';
+import type { FieldRule } from '../../flow/field-matcher.js';
+import { makeDateMatcher, matchSlotMembership, type SlotCandidate } from '../../flow/date-matcher.js';
 import type { ServiceResolutionSummary } from './service-resolver.js';
 import type { LandingObservation, StationId } from '../../flow/station.js';
 import type { StateOf } from '../../flow/state.js';
@@ -346,6 +348,38 @@ export const serviceResolutionToFuzzy = (
 });
 
 /**
+ * Project a FieldMatcher resolution (value = the matched `FieldRule`) onto the
+ * journal-facing `FuzzyResolution<string>` vocabulary, keeping the rule id as the
+ * JSON-lean value (design §6: the strategy trail maps 1:1).
+ */
+export const fieldResolutionToFuzzy = (
+	resolution: FuzzyResolution<FieldRule>,
+): FuzzyResolution<string> => ({
+	value: resolution.value.id,
+	confidence: resolution.confidence,
+	strategy: resolution.strategy,
+	matchedLabel: resolution.matchedLabel,
+	threshold: resolution.threshold,
+	alternates: resolution.alternates,
+});
+
+/**
+ * Project a DateMatcher slot-membership resolution (value = the matched `SlotCandidate`)
+ * onto the journal-facing `FuzzyResolution<string>` vocabulary, keeping the matched
+ * slot's datetime as the JSON-lean value (design §6).
+ */
+export const slotResolutionToFuzzy = (
+	resolution: FuzzyResolution<SlotCandidate>,
+): FuzzyResolution<string> => ({
+	value: resolution.value.datetime,
+	confidence: resolution.confidence,
+	strategy: resolution.strategy,
+	matchedLabel: resolution.matchedLabel,
+	threshold: resolution.threshold,
+	alternates: resolution.alternates,
+});
+
+/**
  * `navigateToBooking` (steps/navigate.ts) as a FlowStep. A factory so the per-flow
  * fuzzy admitting threshold (`minConfidence` — data on the flow definition, see
  * `ACUITY_FLOW_MIN_CONFIDENCE` in flows.ts; design §6) reaches the ServiceResolver
@@ -465,6 +499,14 @@ export const acuityFillFormStep: BookingStep<'client' | 'navigation', 'form'> = 
 						},
 					],
 				} satisfies LandingObservation,
+				// Fuzzy-in audit trail: one resolution per required-textarea label the
+				// FieldMatcher answered (design §6). Projected onto FuzzyResolution<string>
+				// (value = the matched rule id) so the journaled value stays JSON-lean.
+				// Guarded with `?? []` so test stubs that mock the pre-matcher FillFormResult
+				// shape (no fieldResolutions) still produce a valid StepOutcome.
+				...((form.fieldResolutions ?? []).length > 0
+					? { resolutions: (form.fieldResolutions ?? []).map(fieldResolutionToFuzzy) }
+					: {}),
 			})),
 		),
 };
@@ -741,6 +783,38 @@ const slotsOutcome = (
 	state: { slots: slots.map((s) => ({ datetime: s.datetime, available: s.available })) },
 });
 
+/**
+ * Day-level DateMatcher for slot reads: threshold 0.5 admits a same-date match (the
+ * read query is the requested date at midnight, slots are real times on that date, so
+ * the cascade lands on `fuzzy` 0.5 — same date, hour differs). Thresholds are DATA
+ * (design §6); a tenant tightening day matching is a diff, never a code change.
+ */
+const acuitySlotReadMatcher = makeDateMatcher(0.5);
+
+/**
+ * Score the requested date against the slots read for it via the DateMatcher (design §6
+ * fuzzy-in for slot reads): a day-level membership query (`date + 'T00:00:00'`) over the
+ * returned slots surfaces "the calendar landed on slots for the requested date" as a
+ * journalable `FuzzyResolution`, WITHOUT changing the returned `slots` array (the
+ * read-flow result stays byte-identical, golden traces untouched). Best-slot resolution
+ * only; absent when no slot matches the requested date (empty/foreign-month read).
+ */
+const slotsOutcomeWithResolution = (
+	date: string,
+	slots: readonly { readonly datetime: string; readonly available: boolean }[],
+): Effect.Effect<{
+	state: Pick<StateOf<AcuityAvailabilitySlotsFlowSpec>, 'slots'>;
+	resolutions?: readonly FuzzyResolution<unknown>[];
+}> =>
+	matchSlotMembership(acuitySlotReadMatcher, `${date}T00:00:00`, slots).pipe(
+		Effect.map((membership) => ({
+			...slotsOutcome(slots),
+			...(membership.resolution
+				? { resolutions: [slotResolutionToFuzzy(membership.resolution)] }
+				: {}),
+		})),
+	);
+
 /** `readDatesViaUrl` (steps/read-via-url.ts) as a FlowStep. */
 export const acuityReadDatesViaUrlStep: DatesStep<'serviceId' | 'month'> = {
 	meta: {
@@ -834,7 +908,9 @@ export const acuityReadSlotsViaUrlStep: SlotsStep<'serviceId' | 'date'> = {
 		selectorKeys: ['calendar', 'calendarDay', 'timeSlot'],
 	},
 	run: (input) =>
-		readSlotsViaUrl(input.serviceId, input.date).pipe(Effect.map(slotsOutcome)),
+		readSlotsViaUrl(input.serviceId, input.date).pipe(
+			Effect.flatMap((slots) => slotsOutcomeWithResolution(input.date, slots)),
+		),
 };
 
 /** `readTimeSlots` (steps/read-slots.ts, wizard click-through) as a FlowStep. */
@@ -866,7 +942,7 @@ export const acuityReadSlotsWizardStep: SlotsStep<
 		readTimeSlots({
 			serviceName: input.serviceName ?? input.serviceId,
 			date: input.date,
-		}).pipe(Effect.map(slotsOutcome)),
+		}).pipe(Effect.flatMap((slots) => slotsOutcomeWithResolution(input.date, slots))),
 };
 
 /**

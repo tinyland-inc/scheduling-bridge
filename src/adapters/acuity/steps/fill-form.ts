@@ -27,6 +27,13 @@ import { WizardStepError } from '../errors.js';
 import { resolveSelector, Selectors } from '../selectors.js';
 import { DEFAULT_SELECTOR_PROFILE } from '../selector-profile.js';
 import type { ClientInfo } from '../../../core/types.js';
+import {
+	makeFieldMatcher,
+	resolveFieldAnswer,
+	type FieldMatchQuery,
+	type FieldRule,
+} from '../../../flow/field-matcher.js';
+import type { FuzzyMatcher, FuzzyResolution } from '../../../flow/fuzzy.js';
 
 // =============================================================================
 // TYPES
@@ -42,6 +49,14 @@ export interface FillFormParams {
 	readonly howDidYouHear?: string;
 	/** Medication text (default: "None") */
 	readonly medication?: string;
+	/**
+	 * Fuzzy-in matcher for required-textarea label inference (design §6). Optional:
+	 * the step builds the default FieldMatcher (DEFAULT_FIELD_RULES) when absent, so
+	 * the wired behavior is byte-identical to the legacy keyword ladder; callers (and
+	 * the VendorFlowPack) inject a tenant-tuned matcher to tighten/loosen the rules
+	 * as DATA, never a code change.
+	 */
+	readonly fieldMatcher?: FuzzyMatcher<FieldMatchQuery, FieldRule>;
 }
 
 export interface FillFormResult {
@@ -49,6 +64,13 @@ export interface FillFormResult {
 	readonly customFieldsCompleted: string[];
 	readonly intakeFieldsCompleted: string[];
 	readonly advanced: boolean;
+	/**
+	 * Fuzzy-in audit trail for the required-textarea label inference (design §6): one
+	 * `FuzzyResolution` per required textarea the step answered, surfaced so the fold
+	 * journals it per checkpoint (run.ts reads `outcome.resolutions` into rows +
+	 * confidenceFloor). Empty when the page had no required textareas.
+	 */
+	readonly fieldResolutions: readonly FuzzyResolution<FieldRule>[];
 }
 
 // =============================================================================
@@ -93,8 +115,15 @@ export const fillFormFields = (params: FillFormParams) =>
 		// Fill any remaining required textareas that are still empty.
 		// This catches mandatory intake questions (e.g., "What would you like
 		// to work on?", "How many hours of restful sleep?") regardless of their
-		// field IDs, which change when Jen edits the Acuity intake form.
-		yield* fillRequiredTextareas(page, params.client.notes);
+		// field IDs, which change when Jen edits the Acuity intake form. The
+		// label→answer inference is the shared FieldMatcher (design §6); the
+		// resolutions feed StepOutcome.resolutions via FillFormResult.
+		const fieldMatcher = params.fieldMatcher ?? makeFieldMatcher();
+		const fieldResolutions = yield* fillRequiredTextareas(
+			page,
+			fieldMatcher,
+			params.client.notes,
+		);
 		intakeFieldsCompleted.push('requiredTextareas');
 
 		// Fill intake radio buttons (yes/no questions)
@@ -128,6 +157,7 @@ export const fillFormFields = (params: FillFormParams) =>
 			customFieldsCompleted,
 			intakeFieldsCompleted,
 			advanced,
+			fieldResolutions,
 		} satisfies FillFormResult;
 	}).pipe(
 		Effect.catchTag('SelectorError', (e) =>
@@ -236,46 +266,65 @@ const fillCustomField = (
 	});
 
 /**
- * Fill any required textareas that are still empty.
+ * Fill any required textareas that are still empty, inferring each answer from the
+ * field's `<label>` text via the shared FieldMatcher (design §6 fuzzy-in for intake
+ * fields). Acuity intake forms have mandatory custom fields (aria-required="true")
+ * whose field IDs change when the practitioner edits the form, so the inference keys
+ * off label TEXT, not ids.
  *
- * Acuity intake forms have mandatory custom fields (aria-required="true")
- * whose field IDs change when the practitioner edits the form. Instead of
- * hardcoding IDs, we scan the page for any required textarea that hasn't
- * been filled yet and provide a sensible default.
+ * Result-equivalent to the legacy keyword ladder ("work on"/"session" → client notes
+ * else "General wellness"; "sleep" → "7-8 hours"; else "N/A"), now producing a
+ * `FuzzyResolution` per answered textarea for the journal. Structured in three phases —
+ * scan (read empty required textareas + their labels), resolve (FieldMatcher, pure),
+ * fill (write the resolved value) — so the matcher Effect threads cleanly between the
+ * two DOM `tryPromise` boundaries.
  */
 const fillRequiredTextareas = (
 	page: Page,
+	matcher: FuzzyMatcher<FieldMatchQuery, FieldRule>,
 	clientNotes?: string,
-): Effect.Effect<void, never> =>
-	Effect.tryPromise({
-		try: async () => {
-			const textareas = await page.$$('textarea[aria-required="true"]');
-			for (const textarea of textareas) {
-				const currentValue = await textarea.evaluate(
-					(el) => (el as HTMLTextAreaElement).value,
-				);
-				if (currentValue.trim()) continue; // Already filled
+): Effect.Effect<readonly FuzzyResolution<FieldRule>[], never> =>
+	Effect.gen(function* () {
+		// Phase 1: scan empty required textareas and their labels (one DOM round-trip).
+		const fields = yield* Effect.tryPromise({
+			try: async () => {
+				const textareas = await page.$$('textarea[aria-required="true"]');
+				const collected: { handle: (typeof textareas)[number]; label: string }[] = [];
+				for (const textarea of textareas) {
+					const currentValue = await textarea.evaluate(
+						(el) => (el as HTMLTextAreaElement).value,
+					);
+					if (currentValue.trim()) continue; // Already filled
 
-				// Use client notes for the first empty textarea, "N/A" for the rest
-				const label = await textarea.evaluate((el) => {
-					const container = el.closest('[class*="field"]') ?? el.parentElement;
-					const labelEl = container?.querySelector('label');
-					return labelEl?.textContent?.trim() ?? '';
-				});
-
-				let defaultValue = 'N/A';
-				if (label.toLowerCase().includes('work on') || label.toLowerCase().includes('session')) {
-					defaultValue = clientNotes?.trim() || 'General wellness';
-				} else if (label.toLowerCase().includes('sleep')) {
-					defaultValue = '7-8 hours';
+					const label = await textarea.evaluate((el) => {
+						const container = el.closest('[class*="field"]') ?? el.parentElement;
+						const labelEl = container?.querySelector('label');
+						return labelEl?.textContent?.trim() ?? '';
+					});
+					collected.push({ handle: textarea, label });
 				}
+				return collected;
+			},
+			catch: () => [] as { handle: never; label: string }[],
+		}).pipe(Effect.orElseSucceed(() => [] as { handle: never; label: string }[]));
 
-				await textarea.scrollIntoViewIfNeeded();
-				await textarea.fill(defaultValue);
-			}
-		},
-		catch: () => undefined,
-	}).pipe(Effect.orElseSucceed(() => undefined));
+		// Phase 2 + 3: resolve each label via the matcher, then fill the chosen value.
+		const resolutions: FuzzyResolution<FieldRule>[] = [];
+		for (const field of fields) {
+			const { value, resolution } = yield* resolveFieldAnswer(matcher, field.label, clientNotes);
+			if (resolution) resolutions.push(resolution);
+
+			yield* Effect.tryPromise({
+				try: async () => {
+					await field.handle.scrollIntoViewIfNeeded();
+					await field.handle.fill(value);
+				},
+				catch: () => undefined,
+			}).pipe(Effect.orElseSucceed(() => undefined));
+		}
+
+		return resolutions;
+	});
 
 /**
  * Fill intake radio buttons.

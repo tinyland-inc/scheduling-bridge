@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Effect, Exit } from 'effect';
+import fc from 'fast-check';
 import {
 	FuzzyMatchError,
 	ServiceMatcher,
@@ -93,3 +94,88 @@ describe('makeServiceMatcher', () => {
 		expect(ServiceMatcher.key).toBe('scheduling-bridge/ServiceMatcher');
 	});
 });
+
+// =============================================================================
+// PROPERTY TESTS (design §11: bounds, threshold monotonicity, cascade ordering).
+// The ServiceMatcher reuses the shared scorers; covered here alongside the new
+// Date/Field matcher property suites so all three fuzzy lanes share the discipline.
+// =============================================================================
+
+const labelArb = fc.oneof(
+	fc.constantFrom('Deep Tissue Massage', 'Swedish Massage', 'Acupuncture Consult', 'Massage'),
+	fc.string({ maxLength: 24 }),
+);
+
+const candidatesArb = fc.array(
+	fc.record({ label: fc.string({ minLength: 1, maxLength: 24 }), ref: fc.string({ minLength: 1, maxLength: 8 }) }),
+	{ minLength: 0, maxLength: 6 },
+);
+
+describe('ServiceMatcher property tests (§11)', () => {
+	it('scoreLabel confidence is always within [0,1]', () => {
+		fc.assert(
+			fc.property(labelArb, fc.string({ minLength: 1, maxLength: 24 }), (query, label) => {
+				const { confidence } = scoreLabel(query, label);
+				return confidence >= 0 && confidence <= 1;
+			}),
+		);
+	});
+
+	it('an admitted resolution confidence is within [threshold,1] and alternates sorted desc', () => {
+		fc.assert(
+			fc.property(
+				labelArb,
+				candidatesArb,
+				fc.constantFrom(0, 0.3, 0.5, 0.95, 1),
+				(serviceName, candidates, threshold) => {
+					const matcher = makeServiceMatcher(threshold);
+					const exit = Effect.runSyncExit(matcher.match({ serviceName }, candidates));
+					if (Exit.isFailure(exit)) return true;
+					const r = exit.value;
+					if (r.confidence < threshold || r.confidence > 1) return false;
+					const confs = r.alternates.map((a) => a.confidence);
+					for (let i = 1; i < confs.length; i++) {
+						if (confs[i] > confs[i - 1]) return false;
+					}
+					return true;
+				},
+			),
+		);
+	});
+
+	it('threshold monotonicity: a higher threshold never admits where a lower one rejected', () => {
+		fc.assert(
+			fc.property(
+				labelArb,
+				candidatesArb,
+				fc.tuple(fc.constantFrom(0, 0.3, 0.5), fc.constantFrom(0.5, 0.95, 1)),
+				(serviceName, candidates, [lo, hi]) => {
+					const low = Math.min(lo, hi);
+					const high = Math.max(lo, hi);
+					const lowAdmits = Exit.isSuccess(
+						Effect.runSyncExit(makeServiceMatcher(low).match({ serviceName }, candidates)),
+					);
+					const highAdmits = Exit.isSuccess(
+						Effect.runSyncExit(makeServiceMatcher(high).match({ serviceName }, candidates)),
+					);
+					return !highAdmits || lowAdmits;
+				},
+			),
+		);
+	});
+
+	it('cascade ordering: a normalized-exact match outranks token-overlap and fuzzy strategies', () => {
+		fc.assert(
+			fc.property(labelArb, (label) => {
+				// An identical label must resolve normalized-exact at 0.95 (id-match needs a ref).
+				const exact = scoreLabel(label, label);
+				if (normalizeForTest(label).length === 0) return true;
+				return exact.strategy === 'normalized-exact' && exact.confidence === 0.95;
+			}),
+		);
+	});
+});
+
+/** Mirror of the scorer's normalize (lowercase, strip punctuation) for the empty guard. */
+const normalizeForTest = (s: string): string =>
+	s.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();

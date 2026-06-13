@@ -18,13 +18,17 @@
  * Chromium is ever launched.
  */
 
-import { Effect } from 'effect';
+import { Effect, Layer } from 'effect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PaymentCapabilities } from '@tummycrypt/scheduling-kit/payments';
 
 const stepMocks = vi.hoisted(() => ({
 	navigateToBooking: vi.fn(),
 	fillFormFields: vi.fn(),
-	bypassPayment: vi.fn(),
+	// Payment-injection sub-flow (design §7; TIN-2095).
+	openCouponEntry: vi.fn(),
+	applyCoupon: vi.fn(),
+	verifyZeroTotal: vi.fn(),
 	submitBooking: vi.fn(),
 	extractConfirmation: vi.fn(),
 	readAvailableDates: vi.fn(),
@@ -40,7 +44,9 @@ vi.mock('../../adapters/acuity/steps/index.js', async (importOriginal) => {
 		...actual,
 		navigateToBooking: stepMocks.navigateToBooking,
 		fillFormFields: stepMocks.fillFormFields,
-		bypassPayment: stepMocks.bypassPayment,
+		openCouponEntry: stepMocks.openCouponEntry,
+		applyCoupon: stepMocks.applyCoupon,
+		verifyZeroTotal: stepMocks.verifyZeroTotal,
 		submitBooking: stepMocks.submitBooking,
 		extractConfirmation: stepMocks.extractConfirmation,
 		readAvailableDates: stepMocks.readAvailableDates,
@@ -86,6 +92,7 @@ import {
 import type { AppointmentCommand, BridgeAdapterProfile } from '../../async/types.js';
 import { WizardStepError } from '../../adapters/acuity/errors.js';
 import { acuityFlowEnqueuePinning } from '../../adapters/acuity/flows.js';
+import { acuityFlowPack } from '../../adapters/acuity/flow-pack.js';
 
 const adapterProfile: BridgeAdapterProfile = {
 	backend: 'acuity',
@@ -161,7 +168,9 @@ beforeEach(() => {
 			advanced: true,
 		}),
 	);
-	stepMocks.bypassPayment.mockReturnValue(
+	stepMocks.openCouponEntry.mockReturnValue(Effect.succeed({ opened: true }));
+	stepMocks.applyCoupon.mockReturnValue(Effect.succeed({ applied: true }));
+	stepMocks.verifyZeroTotal.mockReturnValue(
 		Effect.succeed({
 			couponApplied: true,
 			code: 'TEST-100',
@@ -215,17 +224,29 @@ describe('runFlow execution: the fold is the only path (status vocabulary preser
 			['acuity/navigate', 'completed'],
 			['acuity/fill-form', 'started'],
 			['acuity/fill-form', 'completed'],
-			['acuity/bypass-payment', 'started'],
-			['acuity/bypass-payment', 'completed'],
+			['acuity/open-coupon-entry', 'started'],
+			['acuity/open-coupon-entry', 'completed'],
+			['acuity/apply-coupon', 'started'],
+			['acuity/apply-coupon', 'completed'],
+			['acuity/verify-zero-total', 'started'],
+			['acuity/verify-zero-total', 'completed'],
 			['acuity/submit', 'started'],
 			['acuity/submit', 'completed'],
 			['acuity/extract-confirmation', 'started'],
 			['acuity/extract-confirmation', 'completed'],
 		]);
-		const bypassCompleted = rows.find(
-			(row) => row.stepId === 'acuity/bypass-payment' && row.status === 'completed',
-		);
-		expect(bypassCompleted?.idempotencyToken).toBe('TEST-100');
+		// Every payment-injection sub-step journals the SAME reused coupon code as its
+		// idempotencyToken (design §5 replayable-write token reuse; TIN-2095).
+		const paymentTokens = rows
+			.filter(
+				(row) =>
+					row.status === 'completed' &&
+					['acuity/open-coupon-entry', 'acuity/apply-coupon', 'acuity/verify-zero-total'].includes(
+						row.stepId,
+					),
+			)
+			.map((row) => row.idempotencyToken);
+		expect(paymentTokens).toEqual(['TEST-100', 'TEST-100', 'TEST-100']);
 	});
 
 	it.each([
@@ -278,7 +299,8 @@ describe('runFlow execution: the fold is the only path (status vocabulary preser
 	);
 
 	it('preserves the exact PAYMENT_BYPASS_NOT_PROVEN failure (Diverged on the payment-injection segment)', async () => {
-		stepMocks.bypassPayment.mockReturnValue(
+		// The $0 proof now diverges at verify-zero-total (design §6; TIN-2095).
+		stepMocks.verifyZeroTotal.mockReturnValue(
 			Effect.succeed({
 				couponApplied: false,
 				code: 'TEST-100',
@@ -392,6 +414,120 @@ describe('runFlow execution: the fold is the only path (status vocabulary preser
 		const slots = await fold.refreshAvailabilitySlots(slotsCommand);
 		expect(slots).toEqual([{ datetime: '2026-06-21T15:00:00.000Z', available: true }]);
 		expect(stepMocks.readTimeSlots).toHaveBeenCalledTimes(1);
+	});
+});
+
+// =============================================================================
+// PAYMENT-INJECTION DOUBLE GATE, UPSTREAM OF BROWSER WORK (design §7; TIN-2095)
+// =============================================================================
+
+describe('payment-injection double gate (checked before any browser work)', () => {
+	const capabilities = (
+		overrides: Partial<PaymentCapabilities> = {},
+	): PaymentCapabilities => ({
+		methods: [],
+		stripe: null,
+		venmo: null,
+		cash: false,
+		...overrides,
+	});
+
+	const venmoAdmits = capabilities({
+		venmo: { available: true, clientId: 'cid', environment: 'production' },
+	});
+
+	/** An executor with a session-layer spy: if the gate denies upstream, the spy
+	 * (browser session provisioning) is NEVER invoked. */
+	const makeGatedExecutor = (
+		paymentCapabilities: () => PaymentCapabilities,
+	) => {
+		const journal = createInMemoryFlowJournal();
+		const segments: string[] = [];
+		const fold = createAcuityBridgeJobExecutor({
+			redisClient: null,
+			flowJournal: journal,
+			paymentCapabilities,
+			sessionLayer: (segment) => {
+				segments.push(segment);
+				return Layer.succeed(
+					// The session layer is only built when the fold opens a segment Scope.
+					// (Tag identity is irrelevant here: a denied gate never reaches it.)
+					{} as never,
+					{} as never,
+				);
+			},
+		});
+		return { fold, segments };
+	};
+
+	it('both admit (pack coupon-bypass AND kit Venmo) → the booking runs through the fold', async () => {
+		const { fold } = makeGatedExecutor(() => venmoAdmits);
+		const booking = await fold.createBookingWithPayment(bookingCommand('TEST-100'), {
+			executionPath: 'browser',
+			operationId: 'op-gate-both',
+		});
+		expect(booking.id).toBe('apt_123');
+		expect(stepMocks.navigateToBooking).toHaveBeenCalledTimes(1);
+		expect(stepMocks.verifyZeroTotal).toHaveBeenCalledTimes(1);
+	});
+
+	it('kit-capability denies → segment skipped UPSTREAM of browser work (no scope, no step ran)', async () => {
+		const { fold, segments } = makeGatedExecutor(() => capabilities()); // no Venmo rail
+		const error = await captureExecutionError(
+			fold.createBookingWithPayment(bookingCommand('TEST-100'), {
+				executionPath: 'browser',
+				operationId: 'op-gate-kit-deny',
+			}),
+		);
+		expect(error.code).toBe('PAYMENT_CAPABILITY_DENIED');
+		expect(error.status).toBe('failed_pre_submit');
+		expect(error.step).toBe('bypass-payment');
+		expect(error.retryable).toBe(false);
+		// Upstream of any browser work: the fold never opened a segment Scope and no
+		// step program ran.
+		expect(segments).toEqual([]);
+		expect(stepMocks.navigateToBooking).not.toHaveBeenCalled();
+		expect(stepMocks.openCouponEntry).not.toHaveBeenCalled();
+		expect(stepMocks.verifyZeroTotal).not.toHaveBeenCalled();
+	});
+
+	it('pack denies (paymentInjection !== coupon-bypass) → segment skipped, kit half not consulted', async () => {
+		const journal = createInMemoryFlowJournal();
+		const segments: string[] = [];
+		let capabilitiesConsulted = false;
+		// A stub pack that does NOT declare coupon-bypass; reuse the real flows so the
+		// executor can construct (only paymentInjection drives the pack half).
+		const nativePack = {
+			...acuityFlowPack,
+			paymentInjection: 'native' as const,
+		};
+		const fold = createAcuityBridgeJobExecutor({
+			redisClient: null,
+			flowJournal: journal,
+			flowPack: nativePack,
+			paymentCapabilities: () => {
+				capabilitiesConsulted = true;
+				return venmoAdmits;
+			},
+			sessionLayer: (segment) => {
+				segments.push(segment);
+				return Layer.succeed({} as never, {} as never);
+			},
+		});
+		const error = await captureExecutionError(
+			fold.createBookingWithPayment(bookingCommand('TEST-100'), {
+				executionPath: 'browser',
+				operationId: 'op-gate-pack-deny',
+			}),
+		);
+		expect(error.code).toBe('PAYMENT_INJECTION_UNSUPPORTED');
+		expect(error.status).toBe('failed_pre_submit');
+		expect(error.retryable).toBe(false);
+		// Pack half is checked FIRST: a denying pack short-circuits before the kit
+		// capability resolver is even consulted, and no browser work happens.
+		expect(capabilitiesConsulted).toBe(false);
+		expect(segments).toEqual([]);
+		expect(stepMocks.navigateToBooking).not.toHaveBeenCalled();
 	});
 });
 
@@ -553,7 +689,10 @@ describe('lease-time plan-hash skew (design §5 plan-hash pinning; flagged path 
 		expect(result?.status).toBe('succeeded');
 		expect(result?.result?.kind).toBe('booking_create_with_payment');
 		const rows = await Effect.runPromise(journal.read(record.operationId));
-		expect(rows.length).toBe(10);
+		// 7 booking steps × (started + completed) after the payment-injection
+		// decomposition (design §7; TIN-2095): navigate, fill-form, open-coupon-entry,
+		// apply-coupon, verify-zero-total, submit, extract-confirmation.
+		expect(rows.length).toBe(14);
 		expect(rows.every((row) => row.planHash === record.planHash)).toBe(true);
 	});
 });

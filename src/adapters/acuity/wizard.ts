@@ -34,6 +34,7 @@ import {
 	readTimeSlots,
 } from './steps/index.js';
 import { readDatesViaUrl, readSlotsViaUrl } from './steps/read-via-url.js';
+import { makeDateMatcher, matchSlotMembership } from '../../flow/date-matcher.js';
 
 // =============================================================================
 // CONFIGURATION
@@ -248,6 +249,13 @@ export const createWizardAdapter = (config: WizardAdapterConfig): SchedulingAdap
 		},
 
 		checkSlotAvailability: (params) => {
+			// DateMatcher (design §6): the TZ-suffix normalization + slot-membership test
+			// formerly inlined in both branches below is now the shared `matchSlotMembership`
+			// over the default DateMatcher (threshold 1.0 admits only the TZ-normalized
+			// exact — behavior-preserving with the legacy `slots.some(...)`). Thresholds are
+			// data; flows loosen the matcher to tolerate minute-level jitter.
+			const dateMatcher = makeDateMatcher();
+
 			if (isAcuityAppointmentTypeId(params.serviceId)) {
 				return pipe(
 					runWizard(
@@ -255,11 +263,11 @@ export const createWizardAdapter = (config: WizardAdapterConfig): SchedulingAdap
 							readSlotsViaUrl(params.serviceId, params.datetime.split('T')[0]),
 						) as Effect.Effect<Array<{ datetime: string; available: boolean }>, MiddlewareError>,
 					),
-					Effect.map((slots) => {
-						const normalize = (dt: string) => dt.replace(/([+-]\d{2}:\d{2}|Z)$/, '');
-						const requestNorm = normalize(params.datetime);
-						return slots.some((s) => s.available && normalize(s.datetime) === requestNorm);
-					}),
+					Effect.flatMap((slots) =>
+						matchSlotMembership(dateMatcher, params.datetime, slots).pipe(
+							Effect.map((result) => result.member),
+						),
+					),
 				);
 			}
 
@@ -278,14 +286,14 @@ export const createWizardAdapter = (config: WizardAdapterConfig): SchedulingAdap
 						) as Effect.Effect<Array<{ datetime: string; available: boolean }>, MiddlewareError>,
 					),
 				),
-				Effect.map((slots) => {
-					// Slots return local time (no TZ suffix: "2026-03-07T14:00:00").
-					// Request datetime should also be local, but normalize both by
-					// stripping any trailing Z or offset for comparison.
-					const normalize = (dt: string) => dt.replace(/([+-]\d{2}:\d{2}|Z)$/, '');
-					const requestNorm = normalize(params.datetime);
-					return slots.some((s) => s.available && normalize(s.datetime) === requestNorm);
-				}),
+				// Slots return local time (no TZ suffix: "2026-03-07T14:00:00"). The
+				// DateMatcher strips any trailing Z/offset from both sides before testing
+				// membership — identical to the legacy normalize-both comparison.
+				Effect.flatMap((slots) =>
+					matchSlotMembership(dateMatcher, params.datetime, slots).pipe(
+						Effect.map((result) => result.member),
+					),
+				),
 			);
 		},
 

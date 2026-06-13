@@ -29,7 +29,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const stepMocks = vi.hoisted(() => ({
 	navigateToBooking: vi.fn(),
 	fillFormFields: vi.fn(),
-	bypassPayment: vi.fn(),
+	// Payment-injection sub-flow (design §7; TIN-2095).
+	openCouponEntry: vi.fn(),
+	applyCoupon: vi.fn(),
+	verifyZeroTotal: vi.fn(),
 	submitBooking: vi.fn(),
 	extractConfirmation: vi.fn(),
 	readAvailableDates: vi.fn(),
@@ -45,7 +48,9 @@ vi.mock('../../adapters/acuity/steps/index.js', async (importOriginal) => {
 		...actual,
 		navigateToBooking: stepMocks.navigateToBooking,
 		fillFormFields: stepMocks.fillFormFields,
-		bypassPayment: stepMocks.bypassPayment,
+		openCouponEntry: stepMocks.openCouponEntry,
+		applyCoupon: stepMocks.applyCoupon,
+		verifyZeroTotal: stepMocks.verifyZeroTotal,
 		submitBooking: stepMocks.submitBooking,
 		extractConfirmation: stepMocks.extractConfirmation,
 		readAvailableDates: stepMocks.readAvailableDates,
@@ -181,7 +186,9 @@ beforeEach(() => {
 			advanced: true,
 		}),
 	);
-	stepMocks.bypassPayment.mockReturnValue(
+	stepMocks.openCouponEntry.mockReturnValue(Effect.succeed({ opened: true }));
+	stepMocks.applyCoupon.mockReturnValue(Effect.succeed({ applied: true }));
+	stepMocks.verifyZeroTotal.mockReturnValue(
 		Effect.succeed({
 			couponApplied: true,
 			code: 'TEST-100',
@@ -317,8 +324,12 @@ describe('booking resume on re-lease (no effectful-once evidence)', () => {
 			['acuity/navigate', 'skipped_resume'],
 			['acuity/fill-form', 'started'],
 			['acuity/fill-form', 'completed'],
-			['acuity/bypass-payment', 'started'],
-			['acuity/bypass-payment', 'completed'],
+			['acuity/open-coupon-entry', 'started'],
+			['acuity/open-coupon-entry', 'completed'],
+			['acuity/apply-coupon', 'started'],
+			['acuity/apply-coupon', 'completed'],
+			['acuity/verify-zero-total', 'started'],
+			['acuity/verify-zero-total', 'completed'],
 			['acuity/submit', 'started'],
 			['acuity/submit', 'completed'],
 			['acuity/extract-confirmation', 'started'],
@@ -359,8 +370,18 @@ describe('confirmation-probe gate on booking resume', () => {
 		await seedRow(journal, operationId, 'acuity/navigate', 'completed');
 		await seedRow(journal, operationId, 'acuity/fill-form', 'started');
 		await seedRow(journal, operationId, 'acuity/fill-form', 'completed');
-		await seedRow(journal, operationId, 'acuity/bypass-payment', 'started');
-		await seedRow(journal, operationId, 'acuity/bypass-payment', 'completed', {
+		// Payment-injection sub-flow (design §7; TIN-2095): all three sub-steps
+		// journaled the same reused coupon token.
+		await seedRow(journal, operationId, 'acuity/open-coupon-entry', 'started');
+		await seedRow(journal, operationId, 'acuity/open-coupon-entry', 'completed', {
+			idempotencyToken: 'TEST-100',
+		});
+		await seedRow(journal, operationId, 'acuity/apply-coupon', 'started');
+		await seedRow(journal, operationId, 'acuity/apply-coupon', 'completed', {
+			idempotencyToken: 'TEST-100',
+		});
+		await seedRow(journal, operationId, 'acuity/verify-zero-total', 'started');
+		await seedRow(journal, operationId, 'acuity/verify-zero-total', 'completed', {
 			idempotencyToken: 'TEST-100',
 		});
 		await seedRow(journal, operationId, 'acuity/submit', 'started');
@@ -383,7 +404,9 @@ describe('confirmation-probe gate on booking resume', () => {
 		expect(stepMocks.submitBooking).not.toHaveBeenCalled();
 		expect(stepMocks.navigateToBooking).not.toHaveBeenCalled();
 		expect(stepMocks.fillFormFields).not.toHaveBeenCalled();
-		expect(stepMocks.bypassPayment).not.toHaveBeenCalled();
+		expect(stepMocks.openCouponEntry).not.toHaveBeenCalled();
+		expect(stepMocks.applyCoupon).not.toHaveBeenCalled();
+		expect(stepMocks.verifyZeroTotal).not.toHaveBeenCalled();
 
 		// Evidence rows: the dangling effectful-once checkpoint is resolved to
 		// completed, and the probe is journaled as completed.
@@ -477,13 +500,21 @@ describe('confirmation-probe gate on booking resume', () => {
 // COUPON idempotencyToken REUSE (design §5 replayable-write token reuse)
 // =============================================================================
 
-describe('payment-injection token reuse on resume', () => {
-	it('threads the journaled coupon token back into the bypass step instead of minting', async () => {
+describe('payment-injection token reuse on resume (design §5; TIN-2095)', () => {
+	it('threads the journaled coupon token back into every payment sub-step instead of minting', async () => {
 		const { journal, executor } = makeExecutor();
 		const operationId = 'op-token-reuse';
-		// An earlier lease journaled the bypass token but no segment boundary
-		// (boundary write lost): the bypass segment re-runs and MUST reuse the token.
-		await seedRow(journal, operationId, 'acuity/bypass-payment', 'completed', {
+		// An earlier lease journaled the payment sub-steps' token but no segment
+		// boundary (the boundary write was lost): the bypass-payment segment re-runs
+		// from its head and EVERY sub-step MUST reuse the journaled token, not mint a
+		// fresh one from the command coupon.
+		await seedRow(journal, operationId, 'acuity/open-coupon-entry', 'completed', {
+			idempotencyToken: 'COUPON-X',
+		});
+		await seedRow(journal, operationId, 'acuity/apply-coupon', 'completed', {
+			idempotencyToken: 'COUPON-X',
+		});
+		await seedRow(journal, operationId, 'acuity/verify-zero-total', 'completed', {
 			idempotencyToken: 'COUPON-X',
 		});
 
@@ -493,16 +524,27 @@ describe('payment-injection token reuse on resume', () => {
 		});
 		expect(booking.id).toBe('apt_123');
 
-		// The journaled token — NOT the freshly minted command coupon — drove the bypass.
-		expect(stepMocks.bypassPayment).toHaveBeenCalledTimes(1);
-		expect(stepMocks.bypassPayment).toHaveBeenCalledWith('COUPON-X');
+		// The journaled token — NOT the freshly minted command coupon 'TEST-100' —
+		// drove all three sub-steps.
+		expect(stepMocks.openCouponEntry).toHaveBeenCalledTimes(1);
+		expect(stepMocks.openCouponEntry).toHaveBeenCalledWith('COUPON-X');
+		expect(stepMocks.applyCoupon).toHaveBeenCalledTimes(1);
+		expect(stepMocks.applyCoupon).toHaveBeenCalledWith('COUPON-X');
+		expect(stepMocks.verifyZeroTotal).toHaveBeenCalledTimes(1);
+		expect(stepMocks.verifyZeroTotal).toHaveBeenCalledWith('COUPON-X');
 
-		// And the re-run's started row re-attaches the journaled token.
+		// And each re-run's started row re-attaches the journaled token.
 		const rows = await Effect.runPromise(journal.read(operationId));
-		const started = rows.filter(
-			(row) => row.stepId === 'acuity/bypass-payment' && row.status === 'started',
-		);
-		expect(started).toHaveLength(1);
-		expect(started[0].idempotencyToken).toBe('COUPON-X');
+		for (const stepId of [
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
+		]) {
+			const started = rows.filter(
+				(row) => row.stepId === stepId && row.status === 'started',
+			);
+			expect(started).toHaveLength(1);
+			expect(started[0].idempotencyToken).toBe('COUPON-X');
+		}
 	});
 });

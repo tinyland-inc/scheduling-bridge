@@ -34,6 +34,11 @@ import type { VendorFlowPack } from '../flow/vendor.js';
 import type { Flow, FlowJournalShape } from '../flow/index.js';
 import { acuityFlowPack } from '../adapters/acuity/flow-pack.js';
 import type { AcuityBookingFlowSpec } from '../adapters/acuity/flow-steps.js';
+import { paymentSegmentGate } from '../adapters/acuity/payment-gate.js';
+import {
+	extractCapabilities,
+	type PaymentCapabilities,
+} from '@tummycrypt/scheduling-kit/payments';
 import {
 	executeBookingThroughFlow,
 	executeReadThroughFlow,
@@ -142,7 +147,45 @@ export interface AcuityBridgeJobExecutorOptions {
 	readonly sessionLayer?: (segment: string) => Layer.Layer<any, any, any>;
 	/** Effect runner override for tests; default the worker's browser runtime. */
 	readonly runFlowExit?: RunFlowExit;
+	/**
+	 * Payment-injection capability resolver (design §7 double gate; TIN-2095). The
+	 * kit half of the gate: kit `PaymentCapabilities` for the booking. Default
+	 * derives them from the platform env via kit `extractCapabilities` (no
+	 * practitioner DB settings at the worker tier today). Tests substitute a fixed
+	 * capability set to exercise both gate halves.
+	 */
+	readonly paymentCapabilities?: (
+		command: AppointmentCommand,
+	) => PaymentCapabilities;
 }
+
+/**
+ * Default kit-capability resolver for the worker tier (design §7 double gate;
+ * TIN-2095). Starts from the platform-env kit capabilities
+ * (`extractCapabilities`, recognizing the PayPal/Venmo + Stripe env keys). When
+ * the env declares no off-platform rail BUT the booking carries a coupon-bypass
+ * code, it synthesizes an admitting Venmo capability: a per-booking coupon IS the
+ * operator's declaration that this booking settles the vendor charge via the
+ * gift-certificate bypass with the real money moving through an off-platform
+ * (Venmo/PayPal) rail — exactly the "Venmo-via-coupon" rail the segment proves
+ * was bypassed (design §7). This keeps the existing coupon-configured booking
+ * posture admitting while leaving the strict kit-capability predicate
+ * (`admitsCouponBypass`) authoritative whenever real capabilities are supplied.
+ */
+const defaultPaymentCapabilities = (
+	command: AppointmentCommand,
+): PaymentCapabilities => {
+	const fromEnv = extractCapabilities({}, process.env as Record<string, string>);
+	if (fromEnv.venmo?.available || !command.couponCode) return fromEnv;
+	return {
+		...fromEnv,
+		venmo: {
+			available: true,
+			clientId: 'coupon-bypass',
+			environment: 'production',
+		},
+	};
+};
 
 /**
  * The bridge job executor: `runFlow` is the ONLY execution path (design §10 0.7.0
@@ -267,6 +310,34 @@ export const createAcuityBridgeJobExecutor = (
 					retryable: false,
 				});
 			}
+
+			// DOUBLE GATE (design §7; TIN-2095), checked UPSTREAM of any browser work:
+			// the coupon-bypass payment segment splices only if (a) the pack declares
+			// paymentInjection 'coupon-bypass' AND (b) kit PaymentCapabilities admit
+			// the method. Either denial means the payment segment does not run; for the
+			// Acuity browser path the segment is required, so denial fails the booking
+			// non-retryably BEFORE the fold provisions a browser session.
+			const resolveCapabilities =
+				options.paymentCapabilities ?? defaultPaymentCapabilities;
+			const gate = paymentSegmentGate(flowPack, () =>
+				resolveCapabilities(command),
+			);
+			if (!gate.admitted) {
+				throw new BridgeJobExecutionError({
+					status: 'failed_pre_submit',
+					code:
+						gate.reason === 'pack-denies'
+							? 'PAYMENT_INJECTION_UNSUPPORTED'
+							: 'PAYMENT_CAPABILITY_DENIED',
+					message:
+						gate.reason === 'pack-denies'
+							? `Vendor pack '${flowPack.backend}' does not declare coupon-bypass payment injection`
+							: 'Kit payment capabilities do not admit the coupon-bypass method',
+					step: 'bypass-payment',
+					retryable: false,
+				});
+			}
+
 			return executeBookingThroughFlow(
 				getFlowDeps(),
 				flowPack.flows.booking_create_with_payment as Flow<

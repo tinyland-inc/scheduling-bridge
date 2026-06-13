@@ -29,6 +29,17 @@
  * fold Diverges AT submit instead of blindly probing extract). Their goldens are the
  * FOLD traces — the canonical behavior of the only surviving path.
  *
+ * PAYMENT-SEGMENT GOLDEN UPDATE (design §7; TIN-2095): the single
+ * `acuity/bypass-payment` step is decomposed into the reusable payment-injection
+ * sub-flow — open-coupon-entry → apply-coupon → verify-zero-total — sharing ONE
+ * 'bypass-payment' segment Scope. The payment portion of every booking golden
+ * (happy-booking, bypass-not-proven-*, submit-failure, extract-failure,
+ * retry-booking) was regenerated accordingly: one scope-open then the three
+ * sub-steps, with the $0-proof outcome recorded on verify-zero-total (the
+ * PAYMENT_BYPASS_NOT_PROVEN Diverged outcome moves from the monolith to that
+ * terminal sub-step). This decomposition IS the intended new trace; the
+ * non-payment golden scenarios are untouched.
+ *
  * No production module is modified: stubs are substituted at the module boundary and
  * the browser layers are replaced with counting succeed/sync Layers, so no Chromium is
  * ever launched.
@@ -82,7 +93,11 @@ const harness = vi.hoisted(() => {
 const stepMocks = vi.hoisted(() => ({
 	navigateToBooking: vi.fn(),
 	fillFormFields: vi.fn(),
-	bypassPayment: vi.fn(),
+	// Payment-injection sub-flow (design §7; TIN-2095): the decomposed sub-steps
+	// replace the single bypassPayment program at the trace mock boundary.
+	openCouponEntry: vi.fn(),
+	applyCoupon: vi.fn(),
+	verifyZeroTotal: vi.fn(),
 	submitBooking: vi.fn(),
 	extractConfirmation: vi.fn(),
 	readAvailableDates: vi.fn(),
@@ -101,7 +116,17 @@ vi.mock('../../adapters/acuity/steps/index.js', async (importOriginal) => {
 		...actual,
 		navigateToBooking: harness.traced(E, 'acuity/navigate', stepMocks.navigateToBooking),
 		fillFormFields: harness.traced(E, 'acuity/fill-form', stepMocks.fillFormFields),
-		bypassPayment: harness.traced(E, 'acuity/bypass-payment', stepMocks.bypassPayment),
+		openCouponEntry: harness.traced(
+			E,
+			'acuity/open-coupon-entry',
+			stepMocks.openCouponEntry,
+		),
+		applyCoupon: harness.traced(E, 'acuity/apply-coupon', stepMocks.applyCoupon),
+		verifyZeroTotal: harness.traced(
+			E,
+			'acuity/verify-zero-total',
+			stepMocks.verifyZeroTotal,
+		),
 		submitBooking: harness.traced(E, 'acuity/submit', stepMocks.submitBooking),
 		extractConfirmation: harness.traced(
 			E,
@@ -436,7 +461,9 @@ beforeEach(() => {
 			advanced: true,
 		}),
 	);
-	stepMocks.bypassPayment.mockReturnValue(
+	stepMocks.openCouponEntry.mockReturnValue(Effect.succeed({ opened: true }));
+	stepMocks.applyCoupon.mockReturnValue(Effect.succeed({ applied: true }));
+	stepMocks.verifyZeroTotal.mockReturnValue(
 		Effect.succeed({
 			couponApplied: true,
 			code: 'TEST-100',
@@ -487,8 +514,12 @@ describe('trace conformance: happy paths (runFlow fold vs recorded golden)', () 
 			step('acuity/navigate'),
 			open,
 			step('acuity/fill-form'),
+			// Payment-injection sub-flow (design §7; TIN-2095): three sub-steps share
+			// ONE 'bypass-payment' segment Scope (one scope-open, then the three steps).
 			open,
-			step('acuity/bypass-payment'),
+			step('acuity/open-coupon-entry'),
+			step('acuity/apply-coupon'),
+			step('acuity/verify-zero-total'),
 			open,
 			step('acuity/submit'),
 			open,
@@ -497,10 +528,13 @@ describe('trace conformance: happy paths (runFlow fold vs recorded golden)', () 
 		expect(foldTrace.terminal).toEqual({ status: 'succeeded' });
 		expect((foldTrace.result as { id: string }).id).toBe('apt_123');
 
-		// The fold entered one Scope per plan segment, in plan order.
-		expect(foldSegments).toEqual(
-			acuityFlows.booking_create_with_payment.plan.nodes.map((node) => node.segment),
-		);
+		// The fold entered one Scope per CONTIGUOUS plan segment, in plan order. The
+		// payment-injection sub-flow's three sub-steps share ONE 'bypass-payment'
+		// segment (design §7; TIN-2095), so contiguous-dedupe the per-node segments.
+		const contiguousSegments = acuityFlows.booking_create_with_payment.plan.nodes
+			.map((node) => node.segment)
+			.filter((segment, index, all) => segment !== all[index - 1]);
+		expect(foldSegments).toEqual(contiguousSegments);
 
 		// Journal coherence: the evidence trail mirrors the recorded trace exactly
 		// (started+completed per step, in the executed order).
@@ -510,8 +544,12 @@ describe('trace conformance: happy paths (runFlow fold vs recorded golden)', () 
 			['acuity/navigate', 'completed'],
 			['acuity/fill-form', 'started'],
 			['acuity/fill-form', 'completed'],
-			['acuity/bypass-payment', 'started'],
-			['acuity/bypass-payment', 'completed'],
+			['acuity/open-coupon-entry', 'started'],
+			['acuity/open-coupon-entry', 'completed'],
+			['acuity/apply-coupon', 'started'],
+			['acuity/apply-coupon', 'completed'],
+			['acuity/verify-zero-total', 'started'],
+			['acuity/verify-zero-total', 'completed'],
 			['acuity/submit', 'started'],
 			['acuity/submit', 'completed'],
 			['acuity/extract-confirmation', 'started'],
@@ -589,7 +627,10 @@ describe('trace conformance: bypass-proof failure (design §6 — Diverged on th
 	])(
 		'PAYMENT_BYPASS_NOT_PROVEN: reproduces the golden terminal AND step cutoff (%s)',
 		async (_label, bypassResult, fixture) => {
-			stepMocks.bypassPayment.mockReturnValue(Effect.succeed(bypassResult));
+			// The $0 proof now lives on the terminal sub-step verify-zero-total
+			// (design §6; TIN-2095): open-coupon-entry + apply-coupon succeed, and the
+			// proof fails at verify-zero-total → Diverged ⇒ PAYMENT_BYPASS_NOT_PROVEN.
+			stepMocks.verifyZeroTotal.mockReturnValue(Effect.succeed(bypassResult));
 			const { fold } = makeExecutor();
 
 			const foldTrace = await runBookingTrace(fold, bookingCommand('TEST-100'), {
@@ -597,15 +638,18 @@ describe('trace conformance: bypass-proof failure (design §6 — Diverged on th
 			});
 
 			expect(foldTrace).toEqual(golden(fixture));
-			// Same cutoff: the bypass step program ran (and "succeeded" as a program —
-			// the PROOF failed), and the fold never invoked submit or extract.
+			// Same cutoff class: all three payment sub-steps ran (and "succeeded" as
+			// programs — the PROOF failed at verify-zero-total), and the fold never
+			// invoked submit or extract.
 			expect(foldTrace.events).toEqual([
 				open,
 				step('acuity/navigate'),
 				open,
 				step('acuity/fill-form'),
 				open,
-				step('acuity/bypass-payment'),
+				step('acuity/open-coupon-entry'),
+				step('acuity/apply-coupon'),
+				step('acuity/verify-zero-total'),
 			]);
 			expect(foldTrace.terminal).toEqual({
 				status: 'failed_pre_submit',
@@ -727,7 +771,9 @@ describe('trace conformance: submit/post-submit ambiguity (reconcile_required pa
 			open,
 			step('acuity/fill-form'),
 			open,
-			step('acuity/bypass-payment'),
+			step('acuity/open-coupon-entry'),
+			step('acuity/apply-coupon'),
+			step('acuity/verify-zero-total'),
 			open,
 			step('acuity/submit', 'error:WizardStepError'),
 		]);
@@ -754,7 +800,9 @@ describe('trace conformance: submit/post-submit ambiguity (reconcile_required pa
 			open,
 			step('acuity/fill-form'),
 			open,
-			step('acuity/bypass-payment'),
+			step('acuity/open-coupon-entry'),
+			step('acuity/apply-coupon'),
+			step('acuity/verify-zero-total'),
 			open,
 			step('acuity/submit'),
 			open,
@@ -796,7 +844,9 @@ describe('trace conformance: submit/post-submit ambiguity (reconcile_required pa
 			open,
 			step('acuity/fill-form'),
 			open,
-			step('acuity/bypass-payment'),
+			step('acuity/open-coupon-entry'),
+			step('acuity/apply-coupon'),
+			step('acuity/verify-zero-total'),
 			open,
 			step('acuity/submit'),
 		]);
@@ -936,7 +986,9 @@ describe('trace conformance: retry behavior (requeue + re-lease, full job machin
 			open,
 			step('acuity/fill-form'),
 			open,
-			step('acuity/bypass-payment'),
+			step('acuity/open-coupon-entry'),
+			step('acuity/apply-coupon'),
+			step('acuity/verify-zero-total'),
 			open,
 			step('acuity/submit'),
 			open,
@@ -955,7 +1007,7 @@ describe('trace conformance: retry behavior (requeue + re-lease, full job machin
 // =============================================================================
 
 describe('segment layout: the fold opens session scopes exactly as the (recorded) worker did', () => {
-	it('booking: five single-step scopes, golden groupings, plan-declared segments', async () => {
+	it('booking: five scopes (the bypass-payment segment groups its three sub-steps), golden groupings, plan-declared segments', async () => {
 		const { fold } = makeExecutor();
 
 		const foldTrace = await runBookingTrace(fold, bookingCommand('TEST-100'), {
@@ -964,19 +1016,21 @@ describe('segment layout: the fold opens session scopes exactly as the (recorded
 		const foldGroups = stepGroupings(foldTrace.events);
 		const foldSegments = [...sessionSegments];
 
-		// Same step groupings as the recorded golden, and the canonical layout.
+		// Same step groupings as the recorded golden, and the canonical layout. The
+		// payment-injection sub-flow (design §7; TIN-2095) keeps a SINGLE
+		// 'bypass-payment' scope; its three sub-steps share that one page session.
 		expect(foldGroups).toEqual(stepGroupings(golden('happy-booking').events));
 		expect(foldGroups).toEqual([
 			['acuity/navigate'],
 			['acuity/fill-form'],
-			['acuity/bypass-payment'],
+			['acuity/open-coupon-entry', 'acuity/apply-coupon', 'acuity/verify-zero-total'],
 			['acuity/submit'],
 			['acuity/extract-confirmation'],
 		]);
 
 		// And the layout the PLAN declares is the layout the recorded worker exhibited:
-		// the page-per-step lifecycle is plan data, not coincidence (flow-steps.ts
-		// header — worker-exact single-step segments by explicit decision).
+		// the page lifecycle is plan data, not coincidence (flow-steps.ts header —
+		// worker-exact segments; the payment segment is one page across its sub-steps).
 		const declared = planSegmentGroupings(acuityFlows.booking_create_with_payment);
 		expect(declared.map((group) => group.steps)).toEqual(foldGroups);
 		expect(foldSegments).toEqual(declared.map((group) => group.segment));
@@ -1010,7 +1064,10 @@ describe('segment layout: the fold opens session scopes exactly as the (recorded
 	});
 
 	it('failure cutoffs never open scopes past the failed segment', async () => {
-		stepMocks.bypassPayment.mockReturnValue(
+		// The $0 proof diverges at verify-zero-total (design §6; TIN-2095). The
+		// payment-injection sub-flow shares ONE 'bypass-payment' scope, so the cutoff
+		// still opens exactly three scopes (navigate, fill-form, bypass-payment).
+		stepMocks.verifyZeroTotal.mockReturnValue(
 			Effect.succeed({ couponApplied: false, code: 'TEST-100', totalAfterCoupon: null }),
 		);
 		const { fold } = makeExecutor();

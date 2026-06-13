@@ -9,6 +9,12 @@ export {
 	generateCouponCode,
 	type BypassPaymentResult,
 } from './bypass-payment.js';
+export {
+	openCouponEntry,
+	applyCoupon,
+	verifyZeroTotal,
+	type VerifyZeroTotalResult,
+} from './payment-segment.js';
 export { submitBooking, type SubmitResult } from './submit.js';
 export {
 	extractConfirmation,

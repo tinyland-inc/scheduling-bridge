@@ -11,6 +11,8 @@ import type { Page } from 'playwright-core';
 import type { SelectorHealthReport } from '../adapters/acuity/selector-health.js';
 import type { BridgeBackend, LandingObservation, StationId } from './station.js';
 import type { ServiceMatcher } from './fuzzy.js';
+import type { DateMatcher } from './date-matcher.js';
+import type { FieldMatcher } from './field-matcher.js';
 import type { Flow } from './flow.js';
 
 /** Extracted over selectors.ts:34-308 (interface only; extraction is 0.7.0). */
@@ -34,7 +36,10 @@ export class VendorFlowPack extends Context.Tag('scheduling-bridge/VendorFlowPac
 		readonly selectors: SelectorRegistry;
 		readonly matchers: {
 			readonly service: Context.Tag.Service<ServiceMatcher>;
-			/* date, field matchers are 0.7.0 */
+			/** DateMatcher (TZ-norm + slot membership + month/day targeting), 0.7.0. */
+			readonly date: Context.Tag.Service<DateMatcher>;
+			/** FieldMatcher (intake-label inference), 0.7.0. */
+			readonly field: Context.Tag.Service<FieldMatcher>;
 		};
 		/** E (and R) are erased to `any` at the pack boundary: a pack's flows carry
 		 * vendor-specific error and requirement channels. The Acuity browser pack's

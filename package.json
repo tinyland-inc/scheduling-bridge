@@ -61,6 +61,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "8.11.6",
+    "fast-check": "3.23.2",
     "ioredis-mock": "^8.13.1",
     "publint": "^0.3.18",
     "tsx": "^4.0.0",

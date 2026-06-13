@@ -30,6 +30,33 @@ export {
 	type ServiceCandidate,
 	type ServiceMatchQuery,
 } from './fuzzy.js';
+export {
+	DEFAULT_DATE_MIN_CONFIDENCE,
+	DateMatcher,
+	DateMatcherLive,
+	MONTH_NAMES,
+	makeDateMatcher,
+	matchSlotMembership,
+	parseMonthLabel,
+	parseYearMonthKey,
+	scoreMonthTarget,
+	scoreSlot,
+	stripTzSuffix,
+	type CalendarMonth,
+	type DateMatchQuery,
+	type SlotCandidate,
+} from './date-matcher.js';
+export {
+	DEFAULT_DEFERRED_VALUE,
+	DEFAULT_FIELD_RULES,
+	FieldMatcher,
+	FieldMatcherLive,
+	makeFieldMatcher,
+	resolveFieldAnswer,
+	scoreFieldRule,
+	type FieldMatchQuery,
+	type FieldRule,
+} from './field-matcher.js';
 export type {
 	FlowStep,
 	FlowStepError,

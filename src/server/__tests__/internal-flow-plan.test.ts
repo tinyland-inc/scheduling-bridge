@@ -170,7 +170,9 @@ describe('POST /internal/flows/:flowId/plan', () => {
 		expect(data.plan.nodes.map((node: { stepId: string }) => node.stepId)).toEqual([
 			'acuity/navigate',
 			'acuity/fill-form',
-			'acuity/bypass-payment',
+			'acuity/open-coupon-entry',
+			'acuity/apply-coupon',
+			'acuity/verify-zero-total',
 			'acuity/submit',
 			'acuity/extract-confirmation',
 		]);

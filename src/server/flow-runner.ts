@@ -122,16 +122,31 @@ export const RECONCILE_BOUNDARY_STEP_IDS: ReadonlySet<string> = new Set([
 	'acuity/extract-confirmation',
 ]);
 
-/** Legacy `runWizardStep` step labels, keyed by flow step id (failure `step` parity). */
+/**
+ * Legacy `runWizardStep` step labels, keyed by flow step id (failure `step`
+ * parity). The three payment-injection sub-steps (design §7; TIN-2095) all carry
+ * the legacy 'bypass-payment' label so the failure `step` field is byte-identical
+ * to the deleted legacy path (which had one bypass step).
+ */
 export const LEGACY_STEP_LABELS: Readonly<Record<string, string>> = {
 	'acuity/navigate': 'navigate',
 	'acuity/fill-form': 'fill-form',
-	'acuity/bypass-payment': 'bypass-payment',
+	'acuity/open-coupon-entry': 'bypass-payment',
+	'acuity/apply-coupon': 'bypass-payment',
+	'acuity/verify-zero-total': 'bypass-payment',
 	'acuity/submit': 'submit',
 	'acuity/extract-confirmation': 'extract-confirmation',
 	'acuity/read-dates': 'refresh-availability-dates',
 	'acuity/read-slots': 'refresh-availability-slots',
 };
+
+/**
+ * The step id whose fuzzy-out divergence is the $0-proof failure (design §6:
+ * PAYMENT_BYPASS_NOT_PROVEN as a Diverged outcome on the payment-injection
+ * segment). After the decomposition (TIN-2095) the proof lives on the terminal
+ * sub-step, verify-zero-total.
+ */
+export const PAYMENT_BYPASS_PROOF_STEP_ID = 'acuity/verify-zero-total';
 
 const legacyStepLabel = (stepId: string | undefined): string | undefined =>
 	stepId === undefined ? undefined : (LEGACY_STEP_LABELS[stepId] ?? stepId);
@@ -189,7 +204,7 @@ export const flowCauseToExecutionError = (
 	}
 
 	if (error instanceof FlowDivergedError) {
-		if (error.stepId === 'acuity/bypass-payment') {
+		if (error.stepId === PAYMENT_BYPASS_PROOF_STEP_ID) {
 			return new BridgeJobExecutionError({
 				status: 'failed_pre_submit',
 				code: 'PAYMENT_BYPASS_NOT_PROVEN',

@@ -11,18 +11,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInMemoryBridgeAsyncStore } from '../../async/store.js';
 import { createInMemoryFlowJournal } from '../../flow/journal.js';
 
+// Payment-injection sub-flow (design §7; TIN-2095): the single bypass-payment node
+// is now three sub-steps (s2/s3/s4) sharing the 'bypass-payment' segment.
 const BOOKING_DIAGRAM = [
 	'%% flow: booking_create_with_payment v1.0.0 (acuity)',
 	'flowchart TD',
 	'\ts0["acuity/navigate (segment: navigate, replayable-write)"]',
 	'\ts1["acuity/fill-form (segment: fill-form, replayable-write)"]',
-	'\ts2["acuity/bypass-payment (segment: bypass-payment, replayable-write)"]',
-	'\ts3["acuity/submit (segment: submit, effectful-once)"]',
-	'\ts4["acuity/extract-confirmation (segment: extract-confirmation, read)"]',
+	'\ts2["acuity/open-coupon-entry (segment: bypass-payment, replayable-write)"]',
+	'\ts3["acuity/apply-coupon (segment: bypass-payment, replayable-write)"]',
+	'\ts4["acuity/verify-zero-total (segment: bypass-payment, replayable-write)"]',
+	'\ts5["acuity/submit (segment: submit, effectful-once)"]',
+	'\ts6["acuity/extract-confirmation (segment: extract-confirmation, read)"]',
 	'\ts0 --> s1',
 	'\ts1 --> s2',
 	'\ts2 --> s3',
 	'\ts3 --> s4',
+	'\ts4 --> s5',
+	'\ts5 --> s6',
 	'',
 ].join('\n');
 
@@ -31,13 +37,17 @@ const BOOKING_DIAGRAM_WITH_OVERLAY = [
 	'flowchart TD',
 	'\ts0["acuity/navigate (segment: navigate, replayable-write) [completed]"]:::flow_completed',
 	'\ts1["acuity/fill-form (segment: fill-form, replayable-write) [completed]"]:::flow_completed',
-	'\ts2["acuity/bypass-payment (segment: bypass-payment, replayable-write) [failed]"]:::flow_failed',
-	'\ts3["acuity/submit (segment: submit, effectful-once)"]',
-	'\ts4["acuity/extract-confirmation (segment: extract-confirmation, read)"]',
+	'\ts2["acuity/open-coupon-entry (segment: bypass-payment, replayable-write) [completed]"]:::flow_completed',
+	'\ts3["acuity/apply-coupon (segment: bypass-payment, replayable-write) [completed]"]:::flow_completed',
+	'\ts4["acuity/verify-zero-total (segment: bypass-payment, replayable-write) [failed]"]:::flow_failed',
+	'\ts5["acuity/submit (segment: submit, effectful-once)"]',
+	'\ts6["acuity/extract-confirmation (segment: extract-confirmation, read)"]',
 	'\ts0 --> s1',
 	'\ts1 --> s2',
 	'\ts2 --> s3',
 	'\ts3 --> s4',
+	'\ts4 --> s5',
+	'\ts5 --> s6',
 	'\tclassDef flow_completed fill:#d3f9d8,stroke:#2f9e44,color:#000',
 	'\tclassDef flow_failed fill:#ffe3e3,stroke:#e03131,color:#000',
 	'',
@@ -52,13 +62,19 @@ const seedJournal = async (operationId: string) => {
 		planHash: 'pinned-hash',
 		attempt: 1,
 	};
+	// Payment-injection sub-flow (design §7; TIN-2095): open + apply complete, the
+	// $0 proof fails at verify-zero-total.
 	const rows: readonly { stepId: string; status: 'started' | 'completed' | 'failed' }[] = [
 		{ stepId: 'acuity/navigate', status: 'started' },
 		{ stepId: 'acuity/navigate', status: 'completed' },
 		{ stepId: 'acuity/fill-form', status: 'started' },
 		{ stepId: 'acuity/fill-form', status: 'completed' },
-		{ stepId: 'acuity/bypass-payment', status: 'started' },
-		{ stepId: 'acuity/bypass-payment', status: 'failed' },
+		{ stepId: 'acuity/open-coupon-entry', status: 'started' },
+		{ stepId: 'acuity/open-coupon-entry', status: 'completed' },
+		{ stepId: 'acuity/apply-coupon', status: 'started' },
+		{ stepId: 'acuity/apply-coupon', status: 'completed' },
+		{ stepId: 'acuity/verify-zero-total', status: 'started' },
+		{ stepId: 'acuity/verify-zero-total', status: 'failed' },
 	];
 	for (const row of rows) {
 		await Effect.runPromise(

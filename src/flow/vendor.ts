@@ -12,6 +12,8 @@ import type { SelectorHealthReport } from '../adapters/acuity/selector-health.js
 import type { MiddlewareError } from '../adapters/acuity/errors.js';
 import type { BridgeBackend, LandingObservation, StationId } from './station.js';
 import type { ServiceMatcher } from './fuzzy.js';
+import type { DateMatcher } from './date-matcher.js';
+import type { FieldMatcher } from './field-matcher.js';
 import type { Flow } from './flow.js';
 
 /** Extracted over selectors.ts:34-308 (interface only; extraction is 0.7.0). */
@@ -35,7 +37,10 @@ export class VendorFlowPack extends Context.Tag('scheduling-bridge/VendorFlowPac
 		readonly selectors: SelectorRegistry;
 		readonly matchers: {
 			readonly service: Context.Tag.Service<ServiceMatcher>;
-			/* date, field matchers are 0.7.0 */
+			/** DateMatcher (TZ-norm + slot membership + month/day targeting), 0.7.0. */
+			readonly date: Context.Tag.Service<DateMatcher>;
+			/** FieldMatcher (intake-label inference), 0.7.0. */
+			readonly field: Context.Tag.Service<FieldMatcher>;
 		};
 		/** E includes `undefined`: the existing step programs carry `catch: () =>
 		 * undefined` branches, so their honest error channel is `MiddlewareError |

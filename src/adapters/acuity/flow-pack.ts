@@ -11,6 +11,10 @@
  *   cascade producing a typed LandingObservation with per-probe StationEvidence).
  * - matchers.service: the ServiceResolver cascade scorers via the shared
  *   `makeServiceMatcher` machinery (src/flow/fuzzy.ts).
+ * - matchers.date: the DateMatcher (TZ-suffix normalization + slot membership +
+ *   tolerant month/day targeting) via `makeDateMatcher` (src/flow/date-matcher.ts).
+ * - matchers.field: the FieldMatcher (required-textarea label inference) via
+ *   `makeFieldMatcher` (src/flow/field-matcher.ts).
  * - flows: the three flows (flows.ts).
  * - paymentInjection: 'coupon-bypass' (Acuity's implementation of the
  *   payment-injection segment).
@@ -24,6 +28,8 @@
 import { Context, Layer } from 'effect';
 import { VendorFlowPack } from '../../flow/vendor.js';
 import { makeServiceMatcher } from '../../flow/fuzzy.js';
+import { makeDateMatcher } from '../../flow/date-matcher.js';
+import { makeFieldMatcher } from '../../flow/field-matcher.js';
 import { acuitySelectorRegistry } from './selector-registry.js';
 import { detectAcuityStation } from './station-detector.js';
 import { ACUITY_STATIONS } from './flow-steps.js';
@@ -41,7 +47,11 @@ export const acuityFlowPack: Context.Tag.Service<VendorFlowPack> = {
 	stations: ACUITY_STATIONS,
 	detectStation: detectAcuityStation,
 	selectors: acuitySelectorRegistry,
-	matchers: { service: makeServiceMatcher() },
+	matchers: {
+		service: makeServiceMatcher(),
+		date: makeDateMatcher(),
+		field: makeFieldMatcher(),
+	},
 	flows: acuityFlows,
 	paymentInjection: 'coupon-bypass',
 };

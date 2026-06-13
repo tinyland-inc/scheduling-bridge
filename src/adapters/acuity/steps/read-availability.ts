@@ -13,6 +13,7 @@ import type { Page, ElementHandle } from 'playwright-core';
 import { BrowserService } from '../../../shared/browser-service.js';
 import { WizardStepError } from '../errors.js';
 import { resolveSelector, Selectors } from '../selectors.js';
+import { parseMonthLabel, parseYearMonthKey } from '../../../flow/date-matcher.js';
 
 // =============================================================================
 // TYPES
@@ -260,14 +261,11 @@ const readCalendarDates = (page: Page): Effect.Effect<AvailableDateResult[], Wiz
 		return dates;
 	});
 
-const MONTH_NAMES = [
-	'january', 'february', 'march', 'april', 'may', 'june',
-	'july', 'august', 'september', 'october', 'november', 'december',
-];
-
 /**
  * Get the currently displayed month and year from the calendar label.
- * Retries up to 3 times with brief waits for React rendering.
+ * Retries up to 3 times with brief waits for React rendering. The "March 2026" label
+ * parsing is the shared DateMatcher `parseMonthLabel` (design §6; consolidates the
+ * three former month-parser copies).
  */
 const getCalendarMonthInfo = (
 	page: Page,
@@ -286,27 +284,16 @@ const getCalendarMonthInfo = (
 					for (const selector of Selectors.calendarMonth) {
 						const text = await page.$eval(selector, (el) => el.textContent?.trim() ?? null).catch(() => null);
 						if (text) {
-							// Try "March 2026" or "March\n2026" or "March2026" (nested spans)
-							const match = text.match(/([A-Za-z]+)\s*(\d{4})/);
-							if (match) {
-								const monthIndex = MONTH_NAMES.indexOf(match[1].toLowerCase());
-								if (monthIndex >= 0) {
-									return { month: monthIndex, year: parseInt(match[2], 10) };
-								}
-							}
+							const parsed = parseMonthLabel(text);
+							if (parsed) return parsed;
 						}
 					}
 					// Also try innerText which resolves visibility better than textContent
 					for (const selector of Selectors.calendarMonth) {
 						const text = await page.$eval(selector, (el) => (el as HTMLElement).innerText?.trim() ?? null).catch(() => null);
 						if (text) {
-							const match = text.match(/([A-Za-z]+)\s*(\d{4})/);
-							if (match) {
-								const monthIndex = MONTH_NAMES.indexOf(match[1].toLowerCase());
-								if (monthIndex >= 0) {
-									return { month: monthIndex, year: parseInt(match[2], 10) };
-								}
-							}
+							const parsed = parseMonthLabel(text);
+							if (parsed) return parsed;
 						}
 					}
 					return null;
@@ -336,9 +323,12 @@ const getCalendarMonthInfo = (
  */
 const navigateToMonth = (page: Page, targetMonth: string): Effect.Effect<void, WizardStepError> =>
 	Effect.gen(function* () {
+		// DateMatcher month targeting (design §6): parse the YYYY-MM key via the shared
+		// `parseYearMonthKey`.
+		const parsedTarget = parseYearMonthKey(targetMonth);
 		const [yearStr, monthStr] = targetMonth.split('-');
-		const targetYear = parseInt(yearStr, 10);
-		const targetMonthIdx = parseInt(monthStr, 10) - 1;
+		const targetYear = parsedTarget?.year ?? parseInt(yearStr, 10);
+		const targetMonthIdx = parsedTarget?.month ?? parseInt(monthStr, 10) - 1;
 
 		for (let i = 0; i < 12; i++) {
 			const current = yield* getCalendarMonthInfo(page);

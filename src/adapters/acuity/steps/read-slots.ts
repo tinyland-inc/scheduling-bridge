@@ -11,6 +11,7 @@ import type { Page, ElementHandle } from 'playwright-core';
 import { BrowserService } from '../../../shared/browser-service.js';
 import { WizardStepError } from '../errors.js';
 import { resolveSelector, Selectors } from '../selectors.js';
+import { parseMonthLabel, parseYearMonthKey } from '../../../flow/date-matcher.js';
 
 // =============================================================================
 // TYPES
@@ -184,11 +185,6 @@ const clickServiceBook = (
 		}
 	});
 
-const MONTH_NAMES = [
-	'january', 'february', 'march', 'april', 'may', 'june',
-	'july', 'august', 'september', 'october', 'november', 'december',
-];
-
 const navigateToTargetMonth = (page: Page, targetMonth: string): Effect.Effect<void, WizardStepError> =>
 	Effect.gen(function* () {
 		yield* resolveSelector(page, Selectors.calendar, 10000).pipe(
@@ -202,9 +198,12 @@ const navigateToTargetMonth = (page: Page, targetMonth: string): Effect.Effect<v
 			),
 		);
 
+		// DateMatcher month targeting (design §6): parse the YYYY-MM key via the shared
+		// `parseYearMonthKey` (one of the three former month-parser copies).
+		const parsedTarget = parseYearMonthKey(targetMonth);
 		const [yearStr, monthStr] = targetMonth.split('-');
-		const targetYear = parseInt(yearStr, 10);
-		const targetMonthIdx = parseInt(monthStr, 10) - 1;
+		const targetYear = parsedTarget?.year ?? parseInt(yearStr, 10);
+		const targetMonthIdx = parsedTarget?.month ?? parseInt(monthStr, 10) - 1;
 
 		for (let i = 0; i < 12; i++) {
 			const current = yield* getCalendarMonth(page);
@@ -260,33 +259,25 @@ const getCalendarMonth = (
 			catch: () => null,
 		}).pipe(Effect.orElseSucceed(() => null));
 
-		// Retry up to 3 times — React may still be rendering
+		// Retry up to 3 times — React may still be rendering. The "March 2026" label
+		// parsing is the shared DateMatcher `parseMonthLabel` (design §6; consolidates
+		// the three former month-parser copies).
 		for (let retry = 0; retry < 3; retry++) {
 			const info = yield* Effect.tryPromise({
 				try: async () => {
 					for (const selector of Selectors.calendarMonth) {
 						const text = await page.$eval(selector, (el) => el.textContent?.trim() ?? null).catch(() => null);
 						if (text) {
-							const match = text.match(/([A-Za-z]+)\s*(\d{4})/);
-							if (match) {
-								const monthIndex = MONTH_NAMES.indexOf(match[1].toLowerCase());
-								if (monthIndex >= 0) {
-									return { month: monthIndex, year: parseInt(match[2], 10) };
-								}
-							}
+							const parsed = parseMonthLabel(text);
+							if (parsed) return parsed;
 						}
 					}
 					// Also try innerText which resolves visibility better than textContent
 					for (const selector of Selectors.calendarMonth) {
 						const text = await page.$eval(selector, (el) => (el as HTMLElement).innerText?.trim() ?? null).catch(() => null);
 						if (text) {
-							const match = text.match(/([A-Za-z]+)\s*(\d{4})/);
-							if (match) {
-								const monthIndex = MONTH_NAMES.indexOf(match[1].toLowerCase());
-								if (monthIndex >= 0) {
-									return { month: monthIndex, year: parseInt(match[2], 10) };
-								}
-							}
+							const parsed = parseMonthLabel(text);
+							if (parsed) return parsed;
 						}
 					}
 					return null;

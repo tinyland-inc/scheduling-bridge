@@ -9,35 +9,26 @@ import { Effect } from 'effect';
 import type { Page } from 'playwright-core';
 import { WizardStepError } from './errors.js';
 import { resolveSelector, Selectors } from './selectors.js';
+import {
+	MONTH_NAMES as DATE_MATCHER_MONTH_NAMES,
+	parseMonthLabel as parseMonthLabelShared,
+	parseYearMonthKey as parseYearMonthKeyShared,
+	type CalendarMonth as DateMatcherCalendarMonth,
+} from '../../flow/date-matcher.js';
 
 // =============================================================================
-// MONTH NAMES
+// MONTH NAMES — re-exported from the DateMatcher SSOT (design §6; consolidates the
+// three former month-parser copies into src/flow/date-matcher.ts).
 // =============================================================================
 
-export const MONTH_NAMES: readonly string[] = [
-	'january', 'february', 'march', 'april', 'may', 'june',
-	'july', 'august', 'september', 'october', 'november', 'december',
-];
+export const MONTH_NAMES: readonly string[] = DATE_MATCHER_MONTH_NAMES;
 
-export interface CalendarMonth {
-	readonly month: number;
-	readonly year: number;
-}
+export type CalendarMonth = DateMatcherCalendarMonth;
 
 export const MAX_CALENDAR_NAVIGATION_STEPS = 36;
 
-export const parseYearMonthKey = (value: string): CalendarMonth | null => {
-	const match = value.match(/^(\d{4})-(\d{2})$/);
-	if (!match) return null;
-
-	const year = Number(match[1]);
-	const month = Number(match[2]) - 1;
-	if (!Number.isInteger(year) || !Number.isInteger(month) || month < 0 || month > 11) {
-		return null;
-	}
-
-	return { month, year };
-};
+export const parseYearMonthKey = (value: string): CalendarMonth | null =>
+	parseYearMonthKeyShared(value);
 
 // =============================================================================
 // CALENDAR MONTH PARSING
@@ -99,16 +90,9 @@ export const getCurrentCalendarMonth = (
 
 /**
  * Parse a month label string like "March 2026" or "March\n2026".
+ * Delegates to the DateMatcher SSOT (design §6; was a byte-identical copy).
  */
-const parseMonthLabel = (text: string): { month: number; year: number } | null => {
-	const match = text.trim().match(/([A-Za-z]+)\s*(\d{4})/);
-	if (!match) return null;
-
-	const monthIdx = MONTH_NAMES.indexOf(match[1].toLowerCase());
-	if (monthIdx === -1) return null;
-
-	return { month: monthIdx, year: parseInt(match[2], 10) };
-};
+const parseMonthLabel = (text: string): CalendarMonth | null => parseMonthLabelShared(text);
 
 // =============================================================================
 // CALENDAR NAVIGATION

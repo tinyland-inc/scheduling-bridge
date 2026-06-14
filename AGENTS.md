@@ -6,6 +6,36 @@ This file is the working brief for AI agents and LLMs operating in the
 `scheduling-bridge` repo, formerly `acuity-middleware`, which publishes as
 `@tummycrypt/scheduling-bridge`.
 
+## GloriousFlywheel Cache Enrollment (cache-first)
+
+`scheduling-bridge` enrolls in the GloriousFlywheel shared Bazel cache
+(cache-first, TIN-1997 Option D; canary tracked as TIN-2110). This is the
+`runner_mode: shared` canary of the same copyable enrollment kit proven on
+`scheduling-kit`; `runner_mode: shared` stays as-is because it is the variable
+under test.
+
+- **Do NOT** create runners or a bespoke cache instance. Route everything through
+  the shared `tinyland-inc/ci-templates` surface and the existing GloriousFlywheel
+  substrate.
+- **Do NOT** run raw `bazel build` as validation enrollment. A green build on the
+  `tinyland-nix` runner with only `--disk_cache` is **NOT** cache-backed and is
+  not enrollment.
+- Attach to the shared substrate via the cache-backed lane: the ci-templates
+  `js-bazel-package.yml` `cache_backed: true` input, which runs the fail-closed
+  contract checker and then `--config=ci-cached --remote_cache=$BAZEL_REMOTE_CACHE
+  --remote_upload_local_results=false`. The cache endpoint is injected at runtime
+  by the in-cluster `nix-setup` (resolved from cluster DNS); it is never baked
+  into `.bazelrc`.
+- Self-verify with `scripts/cache-attachment-contract.sh --strict` (or
+  `nix develop --command just cache-contract-strict`). The checker fails closed
+  on unset/placeholder/non-grpc endpoints, so a misconfigured lane surfaces the
+  BLOCKED state instead of silently building local-only.
+- REAPI / remote executor is **out of scope** (cache-first only). Never wire
+  `--remote_executor` or `--config=executor-backed`.
+- Cache attach is **not** org-migration closure. A green cache-backed build does
+  not close GF#412 / TIN-1516; org-migration vs widened-ARC-scope remains a
+  separate operator decision.
+
 ## Repo Role
 
 This repo is the remote automation service.

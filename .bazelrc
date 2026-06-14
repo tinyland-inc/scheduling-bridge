@@ -29,8 +29,27 @@ build:ci --color=no
 build:ci --curses=no
 build:ci --show_progress_rate_limit=30
 build:ci --noshow_loading_progress
+# Empty the disk cache in CI so a remote cache hit proves the SHARED remote
+# cache, not an incidental local disk hit. The cache-backed lane layers
+# ci-cached on top of this base (cache-first, TIN-1997 Option D / TIN-2110).
+build:ci --disk_cache=
 test:ci --test_output=errors
 test:ci --test_summary=detailed
+
+# Shared-cache-backed lane (cache-first, TIN-1997 Option D / TIN-2110).
+# Endpoint-free by contract: the ci-templates cache-backed path validates
+# BAZEL_REMOTE_CACHE via scripts/cache-attachment-contract.sh and then supplies
+# --remote_cache=$BAZEL_REMOTE_CACHE at invocation. NEVER bake an endpoint here.
+# Mirrors the proven scheduling-kit / ci-templates bazelrc/ci-cached.bazelrc shape;
+# executor lines are intentionally omitted (cache-first only, no REAPI/executor).
+build:ci-cached --config=ci
+build:ci-cached --remote_upload_local_results=false
+build:ci-cached --remote_download_minimal
+build:ci-cached --remote_timeout=60
+
+# Explicit read-only and disable knobs for proof/debug lanes.
+build:cache-readonly --remote_upload_local_results=false
+build:no-remote-cache --remote_cache=
 
 # Local development (bazel build --config=local //...)
 build:local --disk_cache=~/.cache/bazel-scheduling-bridge

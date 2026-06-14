@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   package:
-    uses: tinyland-inc/ci-templates/.github/workflows/js-bazel-package.yml@v2.3.0
+    uses: tinyland-inc/ci-templates/.github/workflows/js-bazel-package.yml@v2.5.1
     with:
       runner_mode: shared
       shared_runner_labels_json: ${{ vars.PRIMARY_LINUX_RUNNER_LABELS_JSON }}

@@ -38,6 +38,12 @@
 		"cache_rbe_authority": "tinyland-inc/GloriousFlywheel",
 		"package_registry": "tinyland-inc/bazel-registry"
 	},
+	"enrollment": {
+		"forgeScope": "Jesssullivan",
+		"operatorOverlay": "jesssullivan-infra",
+		"executionPool": "tinyland-nix",
+		"substrateMode": "shared-cache-backed"
+	},
 	"supply_chain": {
 		"sbom": {
 			"status": "not-required",

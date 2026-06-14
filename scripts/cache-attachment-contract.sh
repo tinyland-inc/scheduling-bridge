@@ -11,9 +11,14 @@
 # MI logic verbatim.
 #
 # Classification:
-#   BAZEL_REMOTE_EXECUTOR set  => executor-backed   (out of scope this lane; classified, never selected)
+#   BAZEL_REMOTE_EXECUTOR set  => executor-backed   (DEFINED + ENFORCED; never selected by any current repo)
 #   else BAZEL_REMOTE_CACHE set => shared-cache-backed
 #   else                        => compatibility-local-only
+#
+# The DECLARED mode is GF_BAZEL_SUBSTRATE_MODE. TIN-2109 makes this manifest-driven:
+# the cache-backed lane reads tinyland.repo.json `enrollment.substrateMode` and
+# exports it as GF_BAZEL_SUBSTRATE_MODE so the manifest is the AUTHORITATIVE
+# expected mode. Declared-vs-actual is the effective_mode != expected_mode check.
 #
 # Fail-closed (exit 1) when:
 #   - either endpoint contains a literal ${...} placeholder (unexpanded secret/var)
@@ -23,6 +28,14 @@
 #   - executor != cache unless GF_BAZEL_ALLOW_SEPARATE_EXECUTOR_CACHE=true
 #   - declared GF_BAZEL_SUBSTRATE_MODE disagreeing with endpoint presence
 #   - --strict with an empty BAZEL_REMOTE_CACHE
+#   - (TIN-2109) --strict on a hosted / repo-shaped runner: a missing substrate is a
+#     deterministic failure, never a silent degrade to a GitHub-hosted build. Gated by
+#     GF_BAZEL_RUNNER_LABELS; reject ubuntu-*/windows-*/macos-*/bare self-hosted and any
+#     repo-shaped <name>-nix* label. Override only with GF_BAZEL_ALLOW_HOSTED_RUNNER=true.
+#   - (TIN-2109) declared/effective mode executor-backed without the FULL executor
+#     contract: BAZEL_REMOTE_EXECUTOR + BAZEL_REMOTE_CACHE + a cluster runner class +
+#     a proof-artifact image digest (GF_BAZEL_REAPI_PROOF_IMAGE_DIGEST). This contract
+#     is DEFINED + ENFORCED but selected by no current repo (cache-first / Option D).
 
 set -euo pipefail
 
@@ -47,6 +60,19 @@ Environment:
   GF_BAZEL_ALLOW_SEPARATE_EXECUTOR_CACHE
                             Set true to permit executor != cache (default: GF REAPI cell
                             uses one endpoint for both).
+  GF_BAZEL_RUNNER_LABELS    Optional comma/space-separated runner labels. When set under
+                            --strict the gate REJECTS hosted (ubuntu-*/windows-*/macos-*),
+                            bare self-hosted, and repo-shaped (<name>-nix*) labels so a
+                            missing substrate fails closed instead of degrading to a
+                            GitHub-hosted build. Cluster classes: tinyland-nix,
+                            tinyland-nix-heavy, tinyland-nix-kvm, tinyland-nix-gpu,
+                            tinyland-docker, tinyland-dind.
+  GF_BAZEL_ALLOW_HOSTED_RUNNER
+                            Set true to bypass the hosted/repo-label rejection (explicit
+                            escape hatch only; the shared lane never enables it).
+  GF_BAZEL_REAPI_PROOF_IMAGE_DIGEST
+                            Digest-pinned REAPI worker image. REQUIRED when the declared/
+                            effective mode is executor-backed (proof-artifact wiring).
 EOF
 }
 
@@ -125,6 +151,58 @@ endpoint_is_localhost() {
   esac
 }
 
+# --- TIN-2109: runner-class classification (reject hosted / repo-label fallback) ---
+# Cluster capability classes accepted for substrate-backed work. Anything else
+# (GitHub-hosted, bare self-hosted, or a repo-shaped <name>-nix* label) is a
+# silent-degrade vector and must fail closed in --strict.
+runner_labels_raw="${GF_BAZEL_RUNNER_LABELS:-}"
+allow_hosted_runner="${GF_BAZEL_ALLOW_HOSTED_RUNNER:-false}"
+runner_class=""
+runner_reject_reason=""
+is_cluster_label() {
+  case "$1" in
+  tinyland-nix | tinyland-nix-heavy | tinyland-nix-kvm | tinyland-nix-gpu | tinyland-docker | tinyland-dind)
+    return 0 ;;
+  *) return 1 ;;
+  esac
+}
+classify_runner() {
+  # Sets runner_class to the first cluster-class label found. If none, sets
+  # runner_reject_reason to the first disqualifying label (hosted / bare
+  # self-hosted / repo-shaped), else leaves both empty (no labels supplied).
+  local raw="$1"
+  raw="${raw//,/ }"
+  local label
+  for label in ${raw}; do
+    if is_cluster_label "${label}"; then
+      runner_class="${label}"
+      return 0
+    fi
+  done
+  for label in ${raw}; do
+    case "${label}" in
+    ubuntu-* | windows-* | macos-* | ubuntu | windows | macos)
+      runner_reject_reason="hosted GitHub runner label '${label}'"
+      return 0
+      ;;
+    self-hosted)
+      runner_reject_reason="bare 'self-hosted' label (no capability class)"
+      return 0
+      ;;
+    *-nix | *-nix-* | *-docker | *-dind)
+      runner_reject_reason="repo-shaped runner label '${label}' (not a shared tinyland capability class)"
+      return 0
+      ;;
+    esac
+  done
+  if [[ -n ${raw// /} ]]; then
+    runner_reject_reason="no tinyland capability-class label in '${raw}'"
+  fi
+}
+if [[ -n ${runner_labels_raw} ]]; then
+  classify_runner "${runner_labels_raw}"
+fi
+
 allow_localhost="${GF_BAZEL_ALLOW_LOCALHOST_PROOF:-false}"
 localhost_cache=false
 if [[ -n ${remote_cache} ]] && endpoint_is_localhost "${remote_cache}"; then
@@ -143,6 +221,7 @@ Bazel mode:         ${effective_mode}
 Bazel remote cache: ${remote_cache:-unset}
 Bazel executor:     ${remote_executor:-unset}
 Expected mode:      ${expected_mode}
+Runner class:       ${runner_class:-${runner_labels_raw:+unclassified (${runner_labels_raw})}}
 Strict:             ${STRICT}
 
 Contract:
@@ -209,6 +288,44 @@ if [[ -n ${remote_executor} && -n ${remote_cache} &&
   echo
   echo "ERROR: executor-backed mode requires BAZEL_REMOTE_CACHE to match BAZEL_REMOTE_EXECUTOR for the GloriousFlywheel REAPI cell."
   exit 1
+fi
+
+# TIN-2109: reject hosted / repo-shaped runner fallback under --strict. A
+# missing substrate must be a deterministic failure, never a silent degrade to a
+# GitHub-hosted build. Only enforced when runner labels are supplied AND --strict
+# is on, so non-cache-backed callers stay unaffected.
+if [[ ${STRICT} == "true" && -n ${runner_labels_raw} && -z ${runner_class} &&
+  ${allow_hosted_runner} != "true" ]]; then
+  echo
+  echo "ERROR: strict cache-backed lane refuses to run on ${runner_reject_reason:-a non-cluster runner}. The substrate must attach on a shared tinyland capability-class runner (tinyland-nix, tinyland-nix-heavy, tinyland-nix-kvm, tinyland-nix-gpu, tinyland-docker, tinyland-dind). Hosted/repo-label fallback is rejected; set GF_BAZEL_ALLOW_HOSTED_RUNNER=true only with explicit non-shared-lane justification."
+  exit 1
+fi
+
+# TIN-2109: executor-backed contract. When the declared/effective mode is
+# executor-backed, the FULL contract is required and any missing piece fails
+# closed. This is DEFINED + ENFORCED here but selected by NO current repo
+# (cache-first / TIN-1997 Option D); kit/bridge declare shared-cache-backed.
+if [[ ${effective_mode} == "executor-backed" || -n ${remote_executor} ]]; then
+  if [[ -z ${remote_executor} ]]; then
+    echo
+    echo "ERROR: declared substrateMode=executor-backed requires BAZEL_REMOTE_EXECUTOR (the REAPI executor endpoint)."
+    exit 1
+  fi
+  if [[ -z ${remote_cache} ]]; then
+    echo
+    echo "ERROR: executor-backed mode requires BAZEL_REMOTE_CACHE (the CAS/action-cache authority)."
+    exit 1
+  fi
+  if [[ -n ${runner_labels_raw} && -z ${runner_class} && ${allow_hosted_runner} != "true" ]]; then
+    echo
+    echo "ERROR: executor-backed mode requires a cluster runner class for platform identity (@gloriousflywheel//platforms:linux-x86_64); got ${runner_reject_reason:-no capability-class label}."
+    exit 1
+  fi
+  if [[ -z ${GF_BAZEL_REAPI_PROOF_IMAGE_DIGEST:-} ]]; then
+    echo
+    echo "ERROR: executor-backed mode requires GF_BAZEL_REAPI_PROOF_IMAGE_DIGEST (the digest-pinned REAPI worker image for proof-artifact wiring). The flywheel-reapi-proof authority must publish evidence with remote_processes > 0 and a worker_image_digest before a target class is proved."
+    exit 1
+  fi
 fi
 
 if [[ ${STRICT} == "true" && -z ${remote_cache} ]]; then

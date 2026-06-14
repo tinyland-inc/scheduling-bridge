@@ -52,9 +52,32 @@ export const resolveBazelCommand = () => {
   };
 };
 
+// Resolve the Bazel output_user_root for npm-script-driven Bazel invocations
+// (pnpm test / typecheck / check:package). In CI these run BEFORE the
+// ci-templates cache-backed validate step in the same workspace. If they shared
+// the default Bazel output base, their warm local action cache would satisfy
+// the cache-backed step's targets and the shared remote cache would never be
+// queried — a NOMINAL (local/disk-only) result that is NOT enrollment
+// (TIN-2110, cache-first / TIN-1997 Option D). To keep the cache-backed lane a
+// real over-the-wire attach, the npm-script Bazel server is isolated into a
+// dedicated output base in CI so the cache-backed step (which invokes
+// `bazelisk build` directly on the DEFAULT base) starts cold and fetches from
+// the shared remote cache. Local dev is unchanged (default base, no env set).
+const resolveOutputUserRoot = () => {
+  if (process.env.BAZEL_OUTPUT_USER_ROOT) {
+    return process.env.BAZEL_OUTPUT_USER_ROOT;
+  }
+  if (process.env.GITHUB_ACTIONS === 'true' || process.env.CI) {
+    const base =
+      process.env.RUNNER_TEMP || process.env.TMPDIR || process.env.TMP || '/tmp';
+    return path.join(base, 'bazel-npm-script-output-root');
+  }
+  return undefined;
+};
+
 export const runBazel = (...args) => {
   const bazel = resolveBazelCommand();
-  const outputUserRoot = process.env.BAZEL_OUTPUT_USER_ROOT;
+  const outputUserRoot = resolveOutputUserRoot();
   const startupArgs = outputUserRoot ? [`--output_user_root=${outputUserRoot}`] : [];
   const result = run(bazel.command, [...bazel.prefixArgs, ...startupArgs, ...args]);
 

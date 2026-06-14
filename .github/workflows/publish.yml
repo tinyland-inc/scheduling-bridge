@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   package:
-    uses: tinyland-inc/ci-templates/.github/workflows/js-bazel-package.yml@61cd1338ca9dae8a25985c0a36ff7beb111449be
+    uses: tinyland-inc/ci-templates/.github/workflows/js-bazel-package.yml@v2.3.0
     with:
       runner_mode: shared
       shared_runner_labels_json: ${{ vars.PRIMARY_LINUX_RUNNER_LABELS_JSON }}
@@ -41,6 +41,9 @@ jobs:
       build_command: node scripts/check-artifact-authority.mjs
       package_check_command: pnpm check:package
       bazel_targets: "//:pkg //:test"
+      # Cache-first shared-cache-backed Bazel validation (TIN-2110 pilot).
+      # Same opt-in lane as CI; endpoint is runtime authority, no executor.
+      cache_backed: true
       package_dir: ./bazel-bin/pkg
       npm_access: public
       github_package_name: "@jesssullivan/scheduling-bridge"

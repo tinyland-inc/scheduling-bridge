@@ -132,8 +132,12 @@ const modalNodeMajor = parseMajor(
   'Modal NodeSource major',
 );
 const nodeMajorSupported = (major) => supportedNodeMajors.majors.includes(String(major));
+// Accept an immutable pin: either a 40-char commit SHA or a published release
+// tag (vMAJOR.MINOR.PATCH). The cache-backed enrollment (TIN-2110) pins
+// @v2.3.0 — the first ci-templates release exposing the cache_backed input —
+// which is an immutable tag, matching the scheduling-kit enrollment.
 const usesPinnedPackageWorkflow = (workflow) =>
-  /uses:\s*tinyland-inc\/ci-templates\/\.github\/workflows\/js-bazel-package\.yml@[0-9a-fA-F]{40}/.test(
+  /uses:\s*tinyland-inc\/ci-templates\/\.github\/workflows\/js-bazel-package\.yml@(?:[0-9a-fA-F]{40}|v\d+\.\d+\.\d+)/.test(
     workflow,
   );
 const hasWorkflowConcurrency = (workflow) => /\nconcurrency:\n/.test(workflow);

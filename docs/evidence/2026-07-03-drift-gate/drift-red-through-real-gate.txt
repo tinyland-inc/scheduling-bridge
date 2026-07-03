@@ -1,0 +1,66 @@
+TIN-1993 / TIN-2092 drift gate — DRIFTED FIXTURE RED THROUGH THE REAL CONFORMANCE COMPARATOR
+Captured: 2026-07-03  (vitest 4.1.2 via Bazel //:test, --reporter=verbose)
+Repo: Jesssullivan/scheduling-bridge  Branch: codex/tin-1993-drifted-golden  Base: origin/main @ fc1c328
+
+This is a throwaway demonstration (uncommitted trace-drift-red-demo.test.ts, since deleted):
+it runs the real conformance assertion  expect(trace).toEqual(golden)  with the committed
+drifted fixture (trace-golden-drifted/happy-booking.json) as the actual. The committed
+drift-gate test in trace-conformance.test.ts proves the real fold trace deep-equals
+trace-golden/happy-booking.json, so this IS the red the gate emits when the fold drifts.
+
+Bazel result: //:test FAILED (1 fails locally, exit 3) — the gate bites.
+
+================================ vitest failure diff ================================
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/server/__tests__/trace-drift-red-demo.test.ts > DEMO (uncommitted): drifted fixture RED through the real conformance gate > happy-booking: the drifted trace fails expect(trace).toEqual(golden)
+AssertionError: expected { events: [ …(11) ], …(2) } to deeply equal { events: [ …(12) ], …(2) }
+
+- Expected
++ Received
+
+@@ -4,11 +4,11 @@
+        "kind": "scope-open",
+      },
+      {
+        "kind": "step",
+        "outcome": "ok",
+-       "stepId": "acuity/navigate",
++       "stepId": "acuity/navigate-DRIFTED",
+      },
+      {
+        "kind": "scope-open",
+      },
+      {
+@@ -33,13 +33,10 @@
+        "kind": "step",
+        "outcome": "ok",
+        "stepId": "acuity/verify-zero-total",
+      },
+      {
+-       "kind": "scope-open",
+-     },
+-     {
+        "kind": "step",
+        "outcome": "ok",
+        "stepId": "acuity/submit",
+      },
+      {
+@@ -74,8 +71,8 @@
+      "serviceId": "53178494",
+      "serviceName": "TMD single session",
+      "status": "confirmed",
+    },
+    "terminal": {
+-     "status": "succeeded",
++     "status": "failed_pre_submit",
+    },
+  }
+
+ ❯ ../../../../../../../../../../../execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/src/server/__tests__/trace-drift-red-demo.test.ts:28:24
+     26|   const recordedGolden = load(GOLDEN, 'happy-booking');
+     27|   // The real gate. With a drifted `actual`, this THROWS with a precis…
+     28|   expect(driftedTrace).toEqual(recordedGolden);
+       |                        ^
+     29|  });
+     30| });

@@ -1,0 +1,48 @@
+TIN-1993 / TIN-2092 drift gate — FULL SUITE GREEN (committed state)
+Captured: 2026-07-03  (vitest 4.1.2 via Bazel //:test, --reporter=verbose)
+Command: pnpm test  ->  node scripts/run-bazel-target.mjs test //:test
+Repo: Jesssullivan/scheduling-bridge  Branch: codex/tin-1993-drifted-golden  Base: origin/main @ fc1c328
+
+Bazel result:
+//:test                                                         (cached) PASSED in 16.5s
+
+================ vitest summary ================
+ Test Files  65 passed (65)
+      Tests  625 passed (625)
+   Duration  15.39s (transform 2.59s, setup 0ms, import 27.70s, tests 18.17s, environment 15ms)
+
+================ drift gate (a): precise-diff console evidence (real gate, drifted fixture) ================
+=== DRIFT GATE BITES: real conformance comparator vs drifted fixture ===
+  step id     : 'acuity/navigate' (fold) -> 'acuity/navigate-DRIFTED' (drifted)
+  terminal    : 'succeeded' (fold) -> 'failed_pre_submit' (drifted)
+  scope layout: submit regrouped into the bypass-payment session (one fewer scope-open)
+  comparator  : AssertionError thrown by expect(foldTrace).toEqual(drifted)
+=== END DRIFT GATE ===
+
+================ drift gate (a) + (b) — all PASS in the green suite ================
+stdout | src/server/__tests__/trace-conformance.test.ts > drift gate (a): the drifted fixture fails the SAME comparator the 21 conformance tests use > happy-booking: pristine golden GREEN, drifted fixture RED — the real gate bites with a precise diff
+drift gate (a): the drifted fixture fails the SAME comparator the 21 conformance tests use > happy-booking: pristine golden GREEN, drifted fixture RED — the real gate bites with a precise diff 5ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "happy-booking" under mutation "step-reorder" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "happy-booking" under mutation "status-flip" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "happy-booking" under mutation "scope-regroup" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "happy-booking" under mutation "trace-truncation" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "fill-form-failure" under mutation "step-reorder" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "fill-form-failure" under mutation "status-flip" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "fill-form-failure" under mutation "scope-regroup" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "fill-form-failure" under mutation "trace-truncation" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "submit-failure" under mutation "step-reorder" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "submit-failure" under mutation "status-flip" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "submit-failure" under mutation "scope-regroup" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "submit-failure" under mutation "trace-truncation" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "extract-failure" under mutation "step-reorder" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "extract-failure" under mutation "status-flip" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "extract-failure" under mutation "scope-regroup" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "extract-failure" under mutation "trace-truncation" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-total" under mutation "step-reorder" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-total" under mutation "status-flip" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-total" under mutation "scope-regroup" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-total" under mutation "trace-truncation" is rejected by the conformance comparator 1ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-coupon" under mutation "step-reorder" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-coupon" under mutation "status-flip" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-coupon" under mutation "scope-regroup" is rejected by the conformance comparator 0ms
+drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test) > golden "bypass-not-proven-coupon" under mutation "trace-truncation" is rejected by the conformance comparator 0ms

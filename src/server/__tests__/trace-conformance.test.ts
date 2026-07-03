@@ -1085,3 +1085,215 @@ describe('segment layout: the fold opens session scopes exactly as the (recorded
 		);
 	});
 });
+
+// =============================================================================
+// DRIFT GATE — proof that the conformance comparator BITES (TIN-1993 / TIN-2092)
+// =============================================================================
+//
+// EVIDENCE OF ABSENCE this closes: the 21 conformance tests above assert the fold
+// REPRODUCES the 14 recorded goldens, but nothing above proves the comparator would
+// REJECT a wrong trace. Until that is shown, every golden proof is unfalsified — a
+// comparator that accepted everything would pass all 21. These tests deliberately
+// feed the SAME comparator path (`runBookingTrace` → `expect(...).toEqual(golden)`)
+// a drifted trace and prove it goes red.
+//
+// They live in THIS file (not a sibling) on purpose: the guarantee is about the
+// EXACT comparator the 21 tests use — the same `runBookingTrace`, the same golden
+// loader semantics, the same `toEqual`. A copy in another module could silently
+// diverge from the real gate; reusing the in-file symbols cannot. The 21 tests and
+// 14 goldens above are untouched — everything here is purely additive.
+
+const DRIFTED_DIR = fileURLToPath(
+	new URL('./__fixtures__/trace-golden-drifted/', import.meta.url),
+);
+
+/** Loads a DELIBERATELY-DRIFTED fixture the same way `golden()` loads a real one. */
+const driftedGolden = (name: string): any =>
+	JSON.parse(readFileSync(`${DRIFTED_DIR}${name}.json`, 'utf8'));
+
+describe('drift gate (a): the drifted fixture fails the SAME comparator the 21 conformance tests use', () => {
+	it('happy-booking: pristine golden GREEN, drifted fixture RED — the real gate bites with a precise diff', async () => {
+		const { fold } = makeExecutor();
+
+		// The identical production of the fold trace the happy-path conformance test
+		// runs (worker.js fold, over the substituted stub set, one Scope per segment).
+		const foldTrace = await runBookingTrace(fold, bookingCommand('TEST-100'), {
+			executionPath: 'browser',
+			operationId: 'op-trace-drift',
+		});
+
+		// CONTROL: the SAME `toEqual` comparator, given the PRISTINE golden, is GREEN.
+		// This is what makes the red below meaningful — the fold is correct; only the
+		// drifted fixture is wrong.
+		expect(foldTrace).toEqual(golden('happy-booking'));
+
+		// THE BITE: the SAME comparator, given the DRIFTED fixture, must reject it.
+		const drifted = driftedGolden('happy-booking');
+		expect(foldTrace).not.toEqual(drifted);
+		// Run the literal conformance assertion (`expect(foldTrace).toEqual(golden)`),
+		// pointed at the drift, and prove it THROWS — i.e. the gate would go red.
+		let caught: Error | undefined;
+		try {
+			expect(foldTrace).toEqual(drifted);
+		} catch (error) {
+			caught = error as Error;
+		}
+		expect(
+			caught,
+			'the real conformance comparator MUST reject the drifted fixture',
+		).toBeInstanceOf(Error);
+
+		// PRECISE DIFF: prove the drift is exactly the three tampered sites and nothing
+		// else — one step id, one terminal status, one scope grouping.
+		//
+		//   (1) step id       acuity/navigate → acuity/navigate-DRIFTED
+		expect(foldTrace.events[1].stepId).toBe('acuity/navigate');
+		expect(drifted.events[1].stepId).toBe('acuity/navigate-DRIFTED');
+		//   (2) terminal      succeeded → failed_pre_submit
+		expect(foldTrace.terminal.status).toBe('succeeded');
+		expect(drifted.terminal.status).toBe('failed_pre_submit');
+		//   (3) scope layout  the scope-open before submit is gone, so submit is
+		//       regrouped into the bypass-payment page session.
+		expect(stepGroupings(foldTrace.events)).toEqual([
+			['acuity/navigate'],
+			['acuity/fill-form'],
+			['acuity/open-coupon-entry', 'acuity/apply-coupon', 'acuity/verify-zero-total'],
+			['acuity/submit'],
+			['acuity/extract-confirmation'],
+		]);
+		expect(stepGroupings(drifted.events)).toEqual([
+			['acuity/navigate-DRIFTED'],
+			['acuity/fill-form'],
+			[
+				'acuity/open-coupon-entry',
+				'acuity/apply-coupon',
+				'acuity/verify-zero-total',
+				'acuity/submit',
+			],
+			['acuity/extract-confirmation'],
+		]);
+		expect(stepGroupings(drifted.events)).not.toEqual(stepGroupings(foldTrace.events));
+
+		// EVIDENCE: surface the precise red the real gate produced, into the vitest
+		// verbose log — this is the "drifted fixture red through the real gate"
+		// captured inside an otherwise-green suite.
+		const diffLines = [
+			'=== DRIFT GATE BITES: real conformance comparator vs drifted fixture ===',
+			`  step id     : '${foldTrace.events[1].stepId}' (fold) -> '${drifted.events[1].stepId}' (drifted)`,
+			`  terminal    : '${foldTrace.terminal.status}' (fold) -> '${drifted.terminal.status}' (drifted)`,
+			`  scope layout: submit regrouped into the bypass-payment session (one fewer scope-open)`,
+			`  comparator  : ${caught?.name ?? 'Error'} thrown by expect(foldTrace).toEqual(drifted)`,
+			'=== END DRIFT GATE ===',
+		];
+		console.log(`\n${diffLines.join('\n')}\n`);
+	});
+});
+
+// -----------------------------------------------------------------------------
+// (b) Parameterized meta-test: mutate loaded goldens in-memory, per mutation
+// class, and assert the SAME `toEqual` comparator rejects EACH class. This
+// generalizes the single drifted fixture into the space of drift the gate must
+// catch: step reorder, status flip, scope regroup, trace truncation.
+// -----------------------------------------------------------------------------
+
+interface DriftMutation {
+	readonly name: string;
+	readonly apply: (golden: any) => any;
+}
+
+const deepClone = (value: any): any => JSON.parse(JSON.stringify(value));
+
+const stepEventIndices = (events: TraceEvent[]): number[] =>
+	events.flatMap((event, index) => (event.kind === 'step' ? [index] : []));
+
+const scopeEventIndices = (events: TraceEvent[]): number[] =>
+	events.flatMap((event, index) => (event.kind === 'scope-open' ? [index] : []));
+
+const DRIFT_MUTATIONS: DriftMutation[] = [
+	{
+		// STEP REORDER: swap the first two executed steps' ids (fold executed them in
+		// the wrong order). Terminal + scope layout untouched — isolates order drift.
+		name: 'step-reorder',
+		apply: (golden) => {
+			const mutant = deepClone(golden);
+			const [a, b] = stepEventIndices(mutant.events);
+			[mutant.events[a].stepId, mutant.events[b].stepId] = [
+				mutant.events[b].stepId,
+				mutant.events[a].stepId,
+			];
+			return mutant;
+		},
+	},
+	{
+		// STATUS FLIP: the terminal job status changed (e.g. succeeded vs
+		// failed_pre_submit vs reconcile_required) — a classification regression.
+		name: 'status-flip',
+		apply: (golden) => {
+			const mutant = deepClone(golden);
+			mutant.terminal.status = `${mutant.terminal.status}__DRIFTED`;
+			return mutant;
+		},
+	},
+	{
+		// SCOPE REGROUP: drop the last scope-open so its step group merges into the
+		// previous page session — a segment/page-lifecycle regression.
+		name: 'scope-regroup',
+		apply: (golden) => {
+			const mutant = deepClone(golden);
+			const scopes = scopeEventIndices(mutant.events);
+			mutant.events.splice(scopes[scopes.length - 1], 1);
+			return mutant;
+		},
+	},
+	{
+		// TRACE TRUNCATION: the fold stopped one step early (or ran one extra) — a
+		// cutoff regression. Drop the terminal-most event.
+		name: 'trace-truncation',
+		apply: (golden) => {
+			const mutant = deepClone(golden);
+			mutant.events = mutant.events.slice(0, -1);
+			return mutant;
+		},
+	},
+];
+
+// The booking-family goldens carry the rich {events (>=2 steps, >=2 scopes),
+// terminal} shape every mutation class needs; the retry/availability goldens have
+// a different top-level shape (retry) or a single-step trace, so this representative
+// set exercises all four classes without touching any of the 14 goldens on disk.
+const META_GOLDENS = [
+	'happy-booking',
+	'fill-form-failure',
+	'submit-failure',
+	'extract-failure',
+	'bypass-not-proven-total',
+	'bypass-not-proven-coupon',
+] as const;
+
+const META_CASES: [string, string, DriftMutation][] = META_GOLDENS.flatMap(
+	(goldenName) =>
+		DRIFT_MUTATIONS.map(
+			(mutation) => [goldenName, mutation.name, mutation] as [string, string, DriftMutation],
+		),
+);
+
+describe('drift gate (b): every mutation class fails the SAME toEqual comparator (meta-test)', () => {
+	it.each(META_CASES)(
+		'golden "%s" under mutation "%s" is rejected by the conformance comparator',
+		(goldenName, _mutationName, mutation) => {
+			const original = golden(goldenName);
+			const mutant = mutation.apply(original);
+
+			// The mutation actually drifted the trace (guards a no-op mutation).
+			expect(mutant).not.toEqual(original);
+
+			// THE GATE: the SAME `expect(actual).toEqual(golden)` the 21 tests use
+			// throws on the drifted trace — the gate bites for this class.
+			expect(() => expect(mutant).toEqual(original)).toThrow();
+
+			// The on-disk golden was NOT mutated in place — the 14 goldens are inputs
+			// only. `golden()` re-reads the file; it must still deep-equal `original`.
+			expect(golden(goldenName)).toEqual(original);
+		},
+	);
+});

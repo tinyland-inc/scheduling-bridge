@@ -64,7 +64,7 @@ image = (
         "ls -la /app/dist/server/handler.js",
     )
     # Supply @tummycrypt/scheduling-kit from the Bazel module graph — NOT npm.
-    # It is a required peerDependency (^0.9.2) but auto-install-peers=false and
+    # It is a required peerDependency (^0.11.1) but auto-install-peers=false and
     # npmjs is frozen at 0.8.0, so the frozen install never places it in
     # node_modules; the entrypoint eagerly imports it and would crashloop at boot.
     # The repo build recipe materializes the Bazel-resolved kit into ./kit (the

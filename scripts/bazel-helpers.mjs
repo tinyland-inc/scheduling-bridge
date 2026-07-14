@@ -121,7 +121,7 @@ export const syncDerivedPackage = () => {
 // Materialize the Bazel-resolved @tummycrypt/scheduling-kit package onto disk so
 // the runtime images (Docker/Modal) can copy it into node_modules. The kit is
 // supplied ONLY from the Bzlmod module graph (//:kit_runtime -> the kit's
-// //:pkg), never npm: it is a required peerDependency (^0.9.2) but npmjs is
+// //:pkg), never npm: it is a required peerDependency (^0.11.1) but npmjs is
 // frozen at 0.8.0 and .npmrc keeps auto-install-peers=false, so the runtime
 // `pnpm install --prod` never resolves it. Without this the container crashloops
 // at boot with ERR_MODULE_NOT_FOUND '@tummycrypt/scheduling-kit'.

@@ -53,7 +53,7 @@ bazel_dep(name = "aspect_rules_swc", version = "2.6.1")
 
 # Primary dependency: scheduling-kit (resolved via the Bzlmod module graph from
 # tinyland-inc/bazel-registry; the npm edge is retired — see BUILD.bazel npm_link_package).
-bazel_dep(name = "tummycrypt_scheduling_kit", version = "0.9.2")
+bazel_dep(name = "tummycrypt_scheduling_kit", version = "0.11.1")
 
 # =============================================================================
 # Node.js toolchain

@@ -86,8 +86,8 @@ Operationally relevant truth:
   delivered through GitHub Packages as `@jesssullivan/scheduling-bridge`
 - npmjs is frozen at `0.5.11` and retired for new versions; existing npmjs
   consumers keep resolving the frozen versions
-- `0.7.1` resolves `tummycrypt_scheduling_kit` `0.9.2` from the Bazel module
-  graph and declares `@tummycrypt/scheduling-kit ^0.9.2` as a required
+- `0.7.1` resolves `tummycrypt_scheduling_kit` `0.11.1` from the Bazel module
+  graph and declares `@tummycrypt/scheduling-kit ^0.11.1` as a required
   `peerDependency` (npm metadata); `0.5.13` depended on the kit `^0.8.0` via
   npm metadata
 - the `0.5.x` line is the async bridge redesign lane: async booking jobs,

@@ -5,7 +5,7 @@
 # The runtime entrypoint (`node dist/server/handler.js`) eagerly imports
 # @tummycrypt/scheduling-kit (dist/core/types.js re-exports the kit; the
 # capabilities surface imports it too). The kit is supplied ONLY from the Bazel
-# module graph — never npm (npmjs is frozen at 0.8.0, below the ^0.9.2 peer
+# module graph — never npm (npmjs is frozen at 0.8.0, below the ^0.11.1 peer
 # range; .npmrc keeps auto-install-peers=false). If the Dockerfile fails to copy
 # the Bazel-resolved kit into node_modules, the container crashloops at boot with
 #   ERR_MODULE_NOT_FOUND '@tummycrypt/scheduling-kit' from /app/dist/core/types.js

@@ -37,7 +37,7 @@ RUN test -f dist/server/handler.js && \
     pnpm install --prod --frozen-lockfile --ignore-scripts
 
 # Supply @tummycrypt/scheduling-kit from the Bazel module graph — NOT npm.
-# The kit is a required peerDependency (^0.9.2) but auto-install-peers=false and
+# The kit is a required peerDependency (^0.11.1) but auto-install-peers=false and
 # npmjs is frozen at 0.8.0, so the frozen install above never places it in
 # node_modules. The runtime entrypoint eagerly imports the kit
 # (dist/core/types.js + the capabilities surface), so without this copy the

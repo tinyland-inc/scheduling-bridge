@@ -55,7 +55,7 @@ derived GitHub Packages artifact carries an explicit, enforced kit requirement
 for npm-style consumers (see `docs/consumers.md` for the alias pair). For the
 bridge repo's own installs the peer is metadata only: `.npmrc` sets
 `auto-install-peers=false` so pnpm does not try to resolve
-`@tummycrypt/scheduling-kit@^0.9.2` from npmjs (where the kit is frozen below
+`@tummycrypt/scheduling-kit@^0.11.1` from npmjs (where the kit is frozen below
 that range). The Docker and Modal runtime images copy `.npmrc` next to
 `pnpm-lock.yaml` for the same reason — the lockfile records
 `autoInstallPeers: false` and frozen installs must agree with it.

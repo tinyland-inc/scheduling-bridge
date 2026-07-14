@@ -90,7 +90,7 @@ import {
 import type { FlowCheckpoint, FlowJournalShape } from '../flow/journal.js';
 import { renderFlowMermaid } from '../flow/mermaid.js';
 import { selectFlowJournal } from './flow-runner.js';
-import { buildHealthPayload } from './health.js';
+import { buildHealthPayload, buildPublicHealthPayload } from './health.js';
 import { handleReady as _handleReady } from './ready.js';
 import {
 	buildAvailabilityDatesCacheKey,
@@ -964,25 +964,44 @@ const handleReady = (res: ServerResponse) =>
 		catalogWarm: async () => (await serviceCatalog.getServices()).length,
 	});
 
-const handleHealth = (_req: IncomingMessage, res: ServerResponse) => {
+/**
+ * True when the request carries a valid Bearer AUTH_TOKEN. `/health` is listed
+ * in `unauthenticatedPaths`, so the central auth gate never 401s it; this local
+ * check upgrades an already-authorized caller to the verbose projection while a
+ * probe / anonymous GET still gets a 200 minimal envelope. Mirrors the exact
+ * `Bearer ${AUTH_TOKEN}` comparison the central gate uses.
+ */
+const isAuthorizedHealthRequest = (req: IncomingMessage): boolean =>
+	!!AUTH_TOKEN && req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
+
+const handleHealth = (req: IncomingMessage, res: ServerResponse) => {
+	// TIN-2826: `/health` stays unauthenticated (k8s/Docker probes + boot smoke
+	// need it public) but the unauthenticated projection is now minimal — the
+	// upstream Acuity baseUrl, config-validity map, endpoint list, and capability
+	// list (incl. `booking:create` / `payment:bypass-coupon`) are served ONLY to
+	// a caller presenting a valid Bearer AUTH_TOKEN. The release block stays on
+	// both projections so deploy/drift audits keep reading the deployed version.
+	const options = {
+		baseUrl: ACUITY_BASE_URL,
+		hasCoupon: !!COUPON_CODE,
+		headless: browserConfig.headless,
+		staticServices: serviceCatalog.staticServicesCount,
+		serviceCacheTtlMs: SERVICE_CACHE_TTL_MS,
+		releaseSha: process.env.MIDDLEWARE_RELEASE_SHA,
+		releaseRef: process.env.MIDDLEWARE_RELEASE_REF,
+		releaseVersion:
+			process.env.MIDDLEWARE_RELEASE_VERSION ??
+			process.env.npm_package_version,
+		releaseBuiltAt:
+			process.env.MIDDLEWARE_RELEASE_BUILT_AT ??
+			process.env.MIDDLEWARE_BUILD_TIMESTAMP,
+		modalEnvironment: process.env.MODAL_ENVIRONMENT,
+	};
 	sendSuccess(
 		res,
-		buildHealthPayload({
-			baseUrl: ACUITY_BASE_URL,
-			hasCoupon: !!COUPON_CODE,
-			headless: browserConfig.headless,
-			staticServices: serviceCatalog.staticServicesCount,
-			serviceCacheTtlMs: SERVICE_CACHE_TTL_MS,
-			releaseSha: process.env.MIDDLEWARE_RELEASE_SHA,
-			releaseRef: process.env.MIDDLEWARE_RELEASE_REF,
-			releaseVersion:
-				process.env.MIDDLEWARE_RELEASE_VERSION ??
-				process.env.npm_package_version,
-			releaseBuiltAt:
-				process.env.MIDDLEWARE_RELEASE_BUILT_AT ??
-				process.env.MIDDLEWARE_BUILD_TIMESTAMP,
-			modalEnvironment: process.env.MODAL_ENVIRONMENT,
-		}),
+		isAuthorizedHealthRequest(req)
+			? buildHealthPayload(options)
+			: buildPublicHealthPayload(options),
 	);
 };
 

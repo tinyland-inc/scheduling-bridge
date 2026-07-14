@@ -14,6 +14,7 @@ Architecture:
   (future) //:glossgenius_adapter
 """
 
+load("@aspect_bazel_lib//lib:copy_directory.bzl", "copy_directory")
 load("@aspect_rules_js//npm:defs.bzl", "npm_link_package", "npm_package")
 load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
 load("@tummycrypt_scheduling_bridge_npm//:defs.bzl", "npm_link_all_packages")
@@ -173,6 +174,26 @@ npm_package(
     package = "@tummycrypt/scheduling-bridge",
     tags = ["manual"],
     version = "0.7.1",
+    visibility = ["//visibility:public"],
+)
+
+# =============================================================================
+# Runtime kit materialization (for Docker/Modal images)
+#
+# The runtime images copy the Bazel-resolved @tummycrypt/scheduling-kit into
+# their node_modules. The kit is supplied ONLY from the Bzlmod module graph
+# (@tummycrypt_scheduling_kit//:pkg, same source the build/test/pkg targets link
+# via npm_link_package above) — never npm: it is a required peerDependency
+# (^0.9.2) but npmjs is frozen at 0.8.0 and .npmrc keeps auto-install-peers=false,
+# so the runtime `pnpm install --prod` never resolves it. Without this the
+# container crashloops at boot with ERR_MODULE_NOT_FOUND. `pnpm build` syncs
+# bazel-bin/kit_runtime -> ./kit (scripts/bazel-helpers.mjs syncDerivedKit); the
+# Dockerfile/modal-app.py copy ./kit into node_modules/@tummycrypt/scheduling-kit.
+copy_directory(
+    name = "kit_runtime",
+    src = "@tummycrypt_scheduling_kit//:pkg",
+    out = "kit_runtime",
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 

@@ -12,5 +12,7 @@ coverage
 *.log
 !pkg
 !pkg/**
+!kit
+!kit/**
 !package.json
 !pnpm-lock.yaml

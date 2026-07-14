@@ -63,6 +63,17 @@ image = (
         "cd /app && pnpm install --prod --frozen-lockfile --ignore-scripts",
         "ls -la /app/dist/server/handler.js",
     )
+    # Supply @tummycrypt/scheduling-kit from the Bazel module graph — NOT npm.
+    # It is a required peerDependency (^0.9.2) but auto-install-peers=false and
+    # npmjs is frozen at 0.8.0, so the frozen install never places it in
+    # node_modules; the entrypoint eagerly imports it and would crashloop at boot.
+    # The repo build recipe materializes the Bazel-resolved kit into ./kit (the
+    # same artifact-only route as ./pkg); add it AFTER the frozen install so pnpm
+    # cannot prune it as an extraneous package.
+    .add_local_dir("kit", "/app/node_modules/@tummycrypt/scheduling-kit", copy=True)
+    .run_commands(
+        "test -f /app/node_modules/@tummycrypt/scheduling-kit/package.json",
+    )
 )
 
 

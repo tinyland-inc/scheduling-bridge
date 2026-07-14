@@ -1,7 +1,16 @@
-import { runBazel, syncDerivedDist, syncDerivedPackage } from './bazel-helpers.mjs';
+import {
+  runBazel,
+  syncDerivedDist,
+  syncDerivedKit,
+  syncDerivedPackage,
+} from './bazel-helpers.mjs';
 
-runBazel('build', '//:pkg');
+runBazel('build', '//:pkg', '//:kit_runtime');
 syncDerivedPackage();
 syncDerivedDist();
+syncDerivedKit();
 
-console.log('Materialized local `pkg/` and `dist/` from Bazel package output `bazel-bin/pkg`.');
+console.log(
+  'Materialized local `pkg/`, `dist/`, and `kit/` from Bazel outputs ' +
+    '(`bazel-bin/pkg`, `bazel-bin/kit_runtime`).',
+);

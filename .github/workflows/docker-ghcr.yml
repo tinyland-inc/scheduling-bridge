@@ -69,13 +69,38 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+      # Build once into the local Docker daemon (single platform => load works)
+      # so the boot smoke and the eventual push share byte-identical image bytes.
+      - id: build
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
-          # Push on branch/tag events; build-only on PRs (validation).
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      # Boot smoke GATE: the image MUST boot and serve GET /health 200 before any
+      # tag is pushed. This catches the @tummycrypt/scheduling-kit packaging
+      # regression (peerDependencies + auto-install-peers=false left the kit out
+      # of the runtime node_modules -> ERR_MODULE_NOT_FOUND -> crashloop) that
+      # forced the blahaj edd159d5 rollback of sha-22b1b7f. Runs on PRs too
+      # (validation-only there), so packaging changes prove bootability pre-merge.
+      - name: Boot smoke (GET /health 200)
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: bash scripts/docker-boot-smoke.sh "$IMAGE"
+
+      # Push only AFTER the boot smoke passes. PRs never push (validation only);
+      # the loaded, smoke-proven image bytes are pushed as-is (no rebuild).
+      - if: github.event_name != 'pull_request'
+        name: Push smoke-proven image
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Pushing $tag"
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"

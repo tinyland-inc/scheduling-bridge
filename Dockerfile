@@ -36,6 +36,22 @@ COPY pkg/ ./
 RUN test -f dist/server/handler.js && \
     pnpm install --prod --frozen-lockfile --ignore-scripts
 
+# Supply @tummycrypt/scheduling-kit from the Bazel module graph — NOT npm.
+# The kit is a required peerDependency (^0.9.2) but auto-install-peers=false and
+# npmjs is frozen at 0.8.0, so the frozen install above never places it in
+# node_modules. The runtime entrypoint eagerly imports the kit
+# (dist/core/types.js + the capabilities surface), so without this copy the
+# container crashloops at boot with ERR_MODULE_NOT_FOUND. The repo build recipe
+# (scripts/build-derived-artifacts.mjs) materializes the Bazel-resolved kit
+# (//:kit_runtime) into ./kit — the same artifact-only route as ./pkg; copy it
+# in AFTER the frozen install so pnpm cannot prune it as an extraneous package.
+COPY kit/ ./node_modules/@tummycrypt/scheduling-kit/
+
+# Fail the build early (not just at container boot) if the kit did not land.
+# The end-to-end ESM boot resolution is proven by the docker-ghcr boot smoke.
+RUN test -f node_modules/@tummycrypt/scheduling-kit/package.json \
+    || (echo "FATAL: @tummycrypt/scheduling-kit missing from node_modules (Bazel kit materialization failed)" >&2; exit 1)
+
 # Non-root user for security
 RUN useradd -m -s /bin/bash middleware
 USER middleware

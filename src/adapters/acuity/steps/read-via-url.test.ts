@@ -7,6 +7,8 @@ import {
 	defaultBrowserConfig,
 } from '../../../shared/browser-service.js';
 import {
+	buildUrlReadTarget,
+	CALENDAR_SELECT_INTERSTITIAL_MESSAGE,
 	dateEmptySettleTimeoutMs,
 	parseTimeSelectionDates,
 	parseTimeSelectionSlots,
@@ -14,6 +16,7 @@ import {
 	readSlotsViaUrl,
 	type TimeSelectionEntry,
 	urlReadNetworkIdleTimeoutMs,
+	waitForAvailabilitySurface,
 } from './read-via-url.js';
 
 describe('URL read timing config', () => {
@@ -295,7 +298,7 @@ describe('readDatesViaUrl DOM behavior', () => {
 		expect(dates).toEqual([{ date: '2026-09-12', slots: 1 }]);
 		expect(fake.navClicks).toEqual(['next', 'next']);
 		expect(fake.gotoUrls[0]).toBe(
-			'https://massageithaca.as.me/?appointmentType=53178494',
+			'https://massageithaca.as.me/?appointmentType=53178494&calendarID=any',
 		);
 	});
 
@@ -312,7 +315,7 @@ describe('readDatesViaUrl DOM behavior', () => {
 
 		expect(dates).toEqual([{ date: '2026-06-07', slots: 1 }]);
 		expect(fake.gotoUrls[0]).toBe(
-			'https://massageithaca.as.me/?appointmentType=53178494',
+			'https://massageithaca.as.me/?appointmentType=53178494&calendarID=any',
 		);
 		expect(fake.page.$eval).not.toHaveBeenCalled();
 	});
@@ -332,8 +335,55 @@ describe('readDatesViaUrl DOM behavior', () => {
 			{ datetime: '2026-06-07T10:00:00', available: true },
 		]);
 		expect(fake.gotoUrls[0]).toBe(
-			'https://massageithaca.as.me/?appointmentType=53178494&date=2026-06-07',
+			'https://massageithaca.as.me/?appointmentType=53178494&calendarID=any&date=2026-06-07',
 		);
 		expect(fake.page.$$).not.toHaveBeenCalled();
+	});
+});
+
+// TIN-3113 contract: multi-practitioner appointment types (>1 calendarID)
+// resolve to a "Select Calendar" interstitial unless the read URL pins a
+// calendarID, and the interstitial must surface as a named failure rather
+// than a blind availability timeout.
+
+describe('buildUrlReadTarget', () => {
+	it('pins calendarID=any so multi-practitioner types skip the interstitial', () => {
+		const url = buildUrlReadTarget('https://example.as.me/', '91150788');
+		expect(url.searchParams.get('appointmentType')).toBe('91150788');
+		expect(url.searchParams.get('calendarID')).toBe('any');
+		expect(url.searchParams.get('date')).toBeNull();
+	});
+
+	it('carries the date param for slot reads alongside the calendar pin', () => {
+		const url = buildUrlReadTarget('https://example.as.me/', '91150788', '2026-07-24');
+		expect(url.searchParams.get('calendarID')).toBe('any');
+		expect(url.searchParams.get('date')).toBe('2026-07-24');
+	});
+});
+
+describe('waitForAvailabilitySurface', () => {
+	const timedOutPage = (interstitialPresent: boolean): Page => ({
+		waitForSelector: vi.fn(async () => {
+			throw new Error('Timeout 10000ms exceeded');
+		}),
+		$: vi.fn(async (selector: string) =>
+			interstitialPresent && selector.includes('.select-calendar') ? {} : null),
+	}) as unknown as Page;
+
+	it('names the calendar-select interstitial instead of a blind timeout', async () => {
+		const error = await Effect.runPromise(
+			Effect.flip(waitForAvailabilitySurface(timedOutPage(true), 10_000, 'read-availability')),
+		);
+		expect(error._tag).toBe('WizardStepError');
+		expect(error.step).toBe('read-availability');
+		expect(error.message).toBe(CALENDAR_SELECT_INTERSTITIAL_MESSAGE);
+	});
+
+	it('keeps the plain timeout message when no interstitial is present', async () => {
+		const error = await Effect.runPromise(
+			Effect.flip(waitForAvailabilitySurface(timedOutPage(false), 10_000, 'read-slots')),
+		);
+		expect(error._tag).toBe('WizardStepError');
+		expect(error.message).toBe('Availability surface did not load within timeout');
 	});
 });

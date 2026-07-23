@@ -279,9 +279,12 @@ export class AcuityScraper {
     try {
       page = await this.createPage();
 
-      // Navigate to service-specific page
+      // Navigate to service-specific page. calendarID=any skips the
+      // multi-practitioner "Select Calendar" interstitial (TIN-3113);
+      // single-calendar types ignore it.
       const url = new URL(this.config.baseUrl);
       url.searchParams.set('appointmentType', serviceId);
+      url.searchParams.set('calendarID', 'any');
       if (month) {
         // Format: YYYY-MM
         url.searchParams.set('month', month);
@@ -349,9 +352,11 @@ export class AcuityScraper {
     try {
       page = await this.createPage();
 
-      // Navigate to service page
+      // Navigate to service page. calendarID=any skips the
+      // multi-practitioner "Select Calendar" interstitial (TIN-3113).
       const url = new URL(this.config.baseUrl);
       url.searchParams.set('appointmentType', serviceId);
+      url.searchParams.set('calendarID', 'any');
 
       await page.goto(url.toString(), { waitUntil: 'networkidle' });
 

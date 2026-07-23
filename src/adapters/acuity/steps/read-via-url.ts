@@ -2,8 +2,10 @@
  * Wizard Steps: URL-Parameter-Based Availability Reading
  *
  * Navigate directly to a service's calendar via ?appointmentType={id}
- * query parameter, bypassing click-through category navigation
- * (which breaks with collapseCategories: true).
+ * &calendarID=any query parameters, bypassing click-through category
+ * navigation (which breaks with collapseCategories: true) and the
+ * multi-practitioner "Select Calendar" interstitial (which otherwise
+ * replaces the availability surface for types with >1 calendarID).
  *
  * These are the primary codepath for /availability/dates and
  * /availability/slots endpoints on the middleware server.
@@ -29,6 +31,20 @@ import {
 // =============================================================================
 // TYPES
 // =============================================================================
+
+/**
+ * Internal marker: the surface wait timed out because Acuity rendered the
+ * multi-practitioner "Select Calendar" interstitial instead of an
+ * availability surface (no calendarID pinned on the URL).
+ */
+class CalendarSelectInterstitialSignal extends Error {
+	constructor() {
+		super('calendar-select interstitial');
+	}
+}
+
+export const CALENDAR_SELECT_INTERSTITIAL_MESSAGE =
+	'Calendar-select interstitial blocked the availability read (multi-practitioner type without a pinned calendarID)';
 
 export interface UrlDateResult {
 	readonly date: string;  // YYYY-MM-DD
@@ -307,7 +323,7 @@ const navigateToServiceCalendar = (
 		catch: (e) => new WizardStepError({ step, message: `Navigation failed: ${e}` }),
 	});
 
-const waitForAvailabilitySurface = (
+export const waitForAvailabilitySurface = (
 	page: Page,
 	timeout: number,
 	step: 'read-availability' | 'read-slots',
@@ -319,7 +335,15 @@ const waitForAvailabilitySurface = (
 			const timeListSelector = Selectors.timeSlot.join(', ');
 			const surfaceSelector = `${calendarSelector}, ${timeListSelector}`;
 
-			await page.waitForSelector(surfaceSelector, { timeout: waitMs });
+			try {
+				await page.waitForSelector(surfaceSelector, { timeout: waitMs });
+			} catch (waitError) {
+				const interstitial = await page
+					.$(Selectors.calendarSelect.join(', '))
+					.catch(() => null);
+				if (interstitial) throw new CalendarSelectInterstitialSignal();
+				throw waitError;
+			}
 
 			const calendar = await page.$(calendarSelector).catch(() => null);
 			if (calendar) return 'calendar' as const;
@@ -329,9 +353,12 @@ const waitForAvailabilitySurface = (
 
 			throw new Error('No known Acuity availability surface matched');
 		},
-		catch: () => new WizardStepError({
+		catch: (e) => new WizardStepError({
 			step,
-			message: 'Availability surface did not load within timeout',
+			message: e instanceof CalendarSelectInterstitialSignal
+				? CALENDAR_SELECT_INTERSTITIAL_MESSAGE
+				: 'Availability surface did not load within timeout',
+			cause: e,
 		}),
 	});
 
@@ -411,13 +438,33 @@ const waitForEnabledCalendarDate = (
 		catch: () => undefined,
 	}).pipe(Effect.ignore);
 
+/**
+ * Build the direct-read URL for a service.
+ *
+ * calendarID=any is pinned unconditionally: types with more than one
+ * practitioner calendar otherwise resolve to the "Select Calendar"
+ * interstitial instead of an availability surface, and 'any' mirrors the
+ * scheduler's default patient-facing view. Single-calendar types ignore it.
+ */
+export const buildUrlReadTarget = (
+	baseUrl: string,
+	serviceId: string,
+	date?: string,
+): URL => {
+	const url = new URL(baseUrl);
+	url.searchParams.set('appointmentType', serviceId);
+	url.searchParams.set('calendarID', 'any');
+	if (date) url.searchParams.set('date', date);
+	return url;
+};
+
 // =============================================================================
 // READ DATES VIA URL PARAM
 // =============================================================================
 
 /**
  * Read available dates by navigating directly to a service's calendar
- * via ?appointmentType={id} URL parameter.
+ * via ?appointmentType={id}&calendarID=any URL parameters.
  *
  * @param serviceId - Acuity numeric appointment type ID
  * @param targetMonth - Optional YYYY-MM to navigate to specific month
@@ -432,8 +479,7 @@ export const readDatesViaUrl = (
 			Effect.mapError((e) => new WizardStepError({ step: 'read-availability', message: `Browser error: ${e._tag}` })),
 		);
 
-		const url = new URL(config.baseUrl);
-		url.searchParams.set('appointmentType', serviceId);
+		const url = buildUrlReadTarget(config.baseUrl, serviceId);
 
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-availability');
 		const surface = yield* waitForAvailabilitySurface(
@@ -491,8 +537,8 @@ export const readDatesViaUrl = (
 
 /**
  * Read time slots by navigating directly to a service's calendar
- * via ?appointmentType={id}&date={YYYY-MM-DD} URL parameters,
- * then clicking the target date tile.
+ * via ?appointmentType={id}&calendarID=any&date={YYYY-MM-DD} URL
+ * parameters, then clicking the target date tile.
  *
  * @param serviceId - Acuity numeric appointment type ID
  * @param date - Target date in YYYY-MM-DD format
@@ -519,9 +565,7 @@ export const readSlotsViaUrl = (
 		let calendarTileCount = 0;
 		let matchedDateFound = false;
 
-		const url = new URL(config.baseUrl);
-		url.searchParams.set('appointmentType', serviceId);
-		url.searchParams.set('date', date);
+		const url = buildUrlReadTarget(config.baseUrl, serviceId, date);
 		const targetMonth = date.slice(0, 7);
 		const slotSelector = Selectors.timeSlot[0]; // button.time-selection
 		const fallbackSelector = Selectors.timeSlot.join(', ');

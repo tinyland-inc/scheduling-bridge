@@ -72,6 +72,12 @@ export const BaseSelectors = {
 	// Category labels
 	serviceCategory: ['.select-label', '.select-label p', '.select-type .select-label'],
 
+	// -- "Select Calendar" interstitial (multi-practitioner types) --
+	// Rendered INSTEAD of the availability surface when a type has more than
+	// one calendarID and the URL does not pin one; it never carries dates or
+	// slots, so surface waits must recognize it as a terminal non-surface.
+	calendarSelect: ['.select-calendar', '.select-calendar .select-item'],
+
 	// -- Calendar page (react-calendar component) --
 	// Wrapper: .monthly-calendar-v2 > .react-calendar.monthly-calendar-react-calendar
 	calendar: ['.monthly-calendar-v2', '.react-calendar', '.monthly-calendar-react-calendar'],
